@@ -22,6 +22,8 @@ cleanup() {
   docker ps -aq --filter "label=orca-docker.session=${TAB}" --filter "label=orca-docker.session=${TAB}-a" \
     --filter "label=orca-docker.session=${TAB}-b" --filter "label=orca-docker.session=${TAB}-local" \
     --filter "label=orca-docker.session=${TAB}-exit" | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker ps -aq --filter "label=orca-docker.instance=orca-smoke-${RUN_ID}-1" --filter "label=orca-docker.instance=orca-smoke-${RUN_ID}-2" \
+    | xargs -r docker rm -f >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -230,6 +232,133 @@ set -e
 [ "$code" = 7 ] && pass "exit status forwarded (7)" || fail "exit status: got $code"
 [ "$out" = "--resume|abc-123|two words|" ] && pass "args forwarded verbatim" || fail "args: got '$out'"
 "$WRAPPER" --rm-session "${TAB}-exit" >/dev/null 2>&1 || true
+
+echo "== environment mode (Orca per-workspace recipe): create"
+export ORCA_DOCKER_STATE_DIR="$TMP/state"
+ENV_INST="orca-smoke-${RUN_ID}-1"
+KH="$FAKE_HOME/.ssh/known_hosts"   # strict: the wrapper must have recorded the container's key here, like Orca expects
+ssh_env() {  # ssh_env <result.json> <command...>
+  local res="$1"; shift
+  local port key user
+  port="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.port' "$res")"
+  key="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.identityFile' "$res")"
+  user="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.username' "$res")"
+  ssh -q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" -o IdentitiesOnly=yes \
+      -i "$key" -p "$port" "$user@127.0.0.1" "$@"
+}
+# The pinned commit exists only on the remote (someone pushed to main): the recipe must fetch it
+# from the ORCA_REPO_URL/ORCA_REPO_REF pair, not fail or fall back to the local HEAD.
+git clone -q "$ORIGIN" "$TMP/pusher" && echo upstream > "$TMP/pusher/upstream.txt" && git -C "$TMP/pusher" add upstream.txt \
+  && git -C "$TMP/pusher" commit -qm "upstream change" && git -C "$TMP/pusher" push -q origin main
+PIN="$(git -C "$TMP/pusher" rev-parse HEAD)"
+! git -C "$WORKTREE" cat-file -e "$PIN" 2>/dev/null && pass "fixture: pinned commit ${PIN:0:7} is not in the host checkout yet"
+set +e
+# Run from an unrelated cwd: the recipe must use ORCA_REPO_PATH, and Orca's pinned commit/branch.
+(cd "$TMP" && HOME="$FAKE_HOME" ORCA_VM_MODE=create ORCA_VM_INSTANCE_ID="$ENV_INST" ORCA_RECIPE_ID=orca-docker \
+  ORCA_PROJECT_ID=proj-1 ORCA_WORKSPACE_ID=ws-1 ORCA_WORKSPACE_NAME="Feature X" ORCA_REPO_PATH="$WORKTREE" \
+  ORCA_REPO_URL="$ORIGIN" ORCA_REPO_BRANCH="feat/x" ORCA_REPO_REF=main ORCA_REPO_REF_HEAD="$PIN" \
+  ORCA_RECIPE_RESULT_SCHEMA_VERSION=2 ORCA_VERSION=smoke ORCA_DOCKER_AUTO_INSTALL=0 \
+  timeout 300 "$WRAPPER" env create >"$TMP/env1.json" 2>"$TMP/env1.log")
+code=$?
+set -e
+[ "$code" = 0 ] && pass "env create exited 0" || { fail "env create exit $code: $(tail -5 "$TMP/env1.log")"; }
+[ "$(wc -l <"$TMP/env1.json")" = 1 ] && node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$TMP/env1.json" 2>/dev/null \
+  && pass "stdout is exactly one JSON result (all chatter on stderr)" || fail "stdout not a single JSON line: $(head -c 300 "$TMP/env1.json")"
+ENV_CONTAINER="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).userData.container' "$TMP/env1.json")"
+node -e '
+const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const [root, user] = [process.argv[2], process.argv[3]]; const t = r.connection.target;
+const ok = r.schemaVersion === 2 && r.checkoutMode === "provisioned-root" && r.connection.type === "ssh"
+  && r.connection.projectRoot === root && t.host === "127.0.0.1" && Number.isInteger(t.port) && t.username === user
+  && t.identitiesOnly === true && require("fs").existsSync(t.identityFile) && t.label.includes("Feature X")
+  && Object.keys(t).sort().join() === "host,identitiesOnly,identityFile,label,port,username";
+process.exit(ok ? 0 : 1)' "$TMP/env1.json" "$WORKTREE" "$(id -un)" \
+  && pass "result: schemaVersion 2, provisioned-root, ssh target on 127.0.0.1 with identity file" || fail "result shape: $(cat "$TMP/env1.json")"
+docker container inspect -f '{{.HostConfig.AutoRemove}} {{len .Mounts}} {{.HostConfig.NetworkMode}} {{index .Config.Labels "orca-docker.kind"}}' "$ENV_CONTAINER" 2>/dev/null | grep -q '^false 0 bridge env$' \
+  && pass "env container: no --rm, no mounts, bridge network, kind=env" || fail "env container config: $(docker container inspect -f '{{.HostConfig.AutoRemove}} {{len .Mounts}} {{.HostConfig.NetworkMode}}' "$ENV_CONTAINER" 2>&1)"
+set +e
+out="$(ssh_env "$TMP/env1.json" "cd '$WORKTREE' && printf '%s|%s|%s|%s|%s|' \"\$(git rev-parse HEAD)\" \"\$(git symbolic-ref --short HEAD)\" \"\$(git remote get-url origin)\" \"\$(git rev-parse origin/main)\" \"\$(git status --porcelain | wc -l)\"; test -f notes.txt && printf 'notes|'; bash -lc 'printf %s \"\${DISPLAY:+display}\"'; echo '|'; echo marker > env-marker.txt; command -v claude >/dev/null && echo claude-ok" 2>&1)"
+code=$?
+set -e
+[ "$code" = 0 ] && case "$out" in "$PIN|feat/x|$ORIGIN|$PIN|0|display|"*claude-ok*) pass "ssh in: exact pinned commit on feat/x, origin/main set, clean tree, login shell sees the desktop" ;; *) fail "ssh checks: $out" ;; esac
+[ "$code" = 0 ] || fail "ssh into environment failed ($code): $out"
+[ "$(git -C "$WORKTREE" status --porcelain)" = "$HOST_STATUS_BEFORE" ] && [ ! -e "$WORKTREE/env-marker.txt" ] && [ "$(git -C "$WORKTREE" rev-parse HEAD)" = "$BASE" ] \
+  && [ "$(git -C "$WORKTREE" rev-parse main)" = "$BASE" ] && pass "host worktree untouched by the environment (HEAD and main still at ${BASE:0:7})" || fail "host worktree changed"
+fp_line="$(ssh-keygen -F "[127.0.0.1]:$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.port' "$TMP/env1.json")" -f "$FAKE_HOME/.ssh/known_hosts" 2>/dev/null | grep -v '^#')"
+[ -n "$fp_line" ] && pass "container host key recorded in the user's known_hosts for its endpoint" || fail "known_hosts entry missing"
+[ -z "$(git -C "$WORKTREE" for-each-ref 'refs/heads/orca-docker-seed*')" ] && pass "temporary seed refs cleaned up" || fail "seed refs left on host: $(git -C "$WORKTREE" for-each-ref 'refs/heads/orca-docker-seed*')"
+
+echo "== environment mode: one agent per workspace"
+set +e
+ssh_env "$TMP/env1.json" "cd '$WORKTREE' && ORCA_DOCKER_AUTO_INSTALL=0 ORCA_DOCKER_MCP=0 ORCA_TAB_ID=tab-one orca-docker bash -c 'echo AGENT_STARTED; sleep 60'" >"$TMP/agent1.log" 2>&1 &
+AGENT1=$!
+for _ in $(seq 1 100); do grep -q AGENT_STARTED "$TMP/agent1.log" 2>/dev/null && break; sleep 0.2; done
+grep -q AGENT_STARTED "$TMP/agent1.log" && pass "first agent launched" || fail "first agent did not start: $(cat "$TMP/agent1.log")"
+out="$(ssh_env "$TMP/env1.json" "cd '$WORKTREE' && ORCA_DOCKER_AUTO_INSTALL=0 ORCA_TAB_ID=tab-two orca-docker bash -c 'echo SECOND_RAN'" 2>&1)"; code=$?
+[ "$code" = 75 ] && case "$out" in *"already has a running agent"*"tab=tab-one"*"another workspace"*) pass "second agent refused (exit 75) with a clear message naming the holder" ;; *) fail "second agent message: $out" ;; esac
+[ "$code" = 75 ] || fail "second agent exit $code (want 75): $out"
+case "$out" in *SECOND_RAN*) fail "second agent actually ran" ;; esac
+ssh_env "$TMP/env1.json" "cd '$WORKTREE' && echo SHELL_OK" 2>/dev/null | grep -q SHELL_OK && pass "plain shell still allowed while an agent runs" || fail "plain shell blocked"
+kill "$AGENT1" 2>/dev/null; wait "$AGENT1" 2>/dev/null
+docker exec "$ENV_CONTAINER" pkill -f 'sleep 60' 2>/dev/null || true
+sleep 1
+out="$(ssh_env "$TMP/env1.json" "cd '$WORKTREE' && ORCA_DOCKER_AUTO_INSTALL=0 ORCA_DOCKER_MCP=0 orca-docker bash -c 'echo THIRD_RAN'" 2>&1)"; code=$?
+set -e
+[ "$code" = 0 ] && case "$out" in *THIRD_RAN*) pass "lock released after the agent died: next agent starts" ;; *) fail "third agent: $out" ;; esac
+[ "$code" = 0 ] || fail "third agent exit $code: $out"
+
+echo "== environment mode: second environment (folder workspace) gets its own host key"
+ENV_INST2="orca-smoke-${RUN_ID}-2"
+FOLDER="$TMP/plain-folder"; mkdir -p "$FOLDER" && echo data > "$FOLDER/data.txt"
+set +e
+(cd "$FOLDER" && HOME="$FAKE_HOME" ORCA_VM_MODE=create ORCA_VM_INSTANCE_ID="$ENV_INST2" ORCA_RECIPE_ID=orca-docker \
+  ORCA_WORKSPACE_ID=ws-2 ORCA_WORKSPACE_NAME="folder" ORCA_REPO_PATH="$FOLDER" ORCA_RECIPE_RESULT_SCHEMA_VERSION=1 \
+  ORCA_DOCKER_DESKTOP=0 ORCA_DOCKER_AUTO_INSTALL=0 timeout 300 "$WRAPPER" env create >"$TMP/env2.json" 2>"$TMP/env2.log")
+code=$?
+set -e
+[ "$code" = 0 ] && node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.exit(r.schemaVersion===1 && !("checkoutMode" in r) && r.connection.projectRoot===process.argv[2] ? 0 : 1)' "$TMP/env2.json" "$FOLDER" \
+  && pass "folder workspace env created (schemaVersion 1, no checkoutMode)" || fail "folder env (exit $code): $(cat "$TMP/env2.json"; tail -3 "$TMP/env2.log")"
+ENV_CONTAINER2="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).userData.container' "$TMP/env2.json" 2>/dev/null || true)"
+ssh_env "$TMP/env2.json" "cat '$FOLDER/data.txt'" 2>/dev/null | grep -q '^data$' && pass "folder contents present over ssh" || fail "folder contents missing"
+fp1="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).userData.hostKeyFingerprint' "$TMP/env1.json")"
+fp2="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).userData.hostKeyFingerprint' "$TMP/env2.json")"
+[ -n "$fp1" ] && [ "$fp1" != "$fp2" ] && pass "distinct per-container ssh host keys ($fp1 / $fp2)" || fail "host key fingerprints: '$fp1' '$fp2'"
+p1="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.port' "$TMP/env1.json")"
+p2="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.port' "$TMP/env2.json")"
+[ "$p1" != "$p2" ] && pass "distinct published ssh ports ($p1, $p2)" || fail "ssh port collision: $p1"
+k1="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.identityFile' "$TMP/env1.json")"
+k2="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).connection.target.identityFile' "$TMP/env2.json")"
+[ "$k1" != "$k2" ] && [ "$(stat -c %a "$k1")" = 600 ] && pass "distinct client keys, private key mode 600" || fail "client keys: $k1 $k2"
+"$WRAPPER" env ls 2>/dev/null | grep -q "$ENV_CONTAINER" && pass "env ls lists the environment" || fail "env ls"
+"$WRAPPER" --gc --all >/dev/null 2>&1; docker container inspect "$ENV_CONTAINER2" >/dev/null 2>&1 && pass "--gc --all leaves environments alone" || fail "--gc removed an environment"
+
+echo "== environment mode: suspend / resume / destroy (lifecycle payload on stdin)"
+payload() { printf '{"schemaVersion":1,"mode":"%s","recipeId":"orca-docker","instanceId":"%s","projectId":"proj-1","workspaceId":"ws-1","workspaceName":"Feature X","recipeResult":%s}\n' "$1" "$2" "$(cat "$3")"; }
+set +e
+payload suspend "$ENV_INST" "$TMP/env1.json" | (cd "$TMP" && HOME="$FAKE_HOME" ORCA_VM_MODE=suspend "$WRAPPER" env suspend >"$TMP/suspend.out" 2>"$TMP/suspend.log")
+code=$?
+set -e
+[ "$code" = 0 ] && [ "$(docker container inspect -f '{{.State.Status}}' "$ENV_CONTAINER")" = exited ] && [ ! -s "$TMP/suspend.out" ] \
+  && pass "suspend (container found via stdin payload): stopped, kept, silent stdout" || fail "suspend exit $code state $(docker container inspect -f '{{.State.Status}}' "$ENV_CONTAINER" 2>&1): $(cat "$TMP/suspend.log")"
+set +e
+payload resume "$ENV_INST" "$TMP/env1.json" | (cd "$TMP" && HOME="$FAKE_HOME" ORCA_VM_MODE=resume ORCA_VM_INSTANCE_ID="$ENV_INST" timeout 120 "$WRAPPER" env resume >"$TMP/resume.json" 2>"$TMP/resume.log")
+code=$?
+set -e
+[ "$code" = 0 ] && [ "$(cat "$TMP/resume.json")" = "$(cat "$TMP/env1.json")" ] && pass "resume re-emits the identical connection result" \
+  || fail "resume exit $code: $(cat "$TMP/resume.json"; tail -3 "$TMP/resume.log")"
+out="$(ssh_env "$TMP/resume.json" "cd '$WORKTREE' && cat env-marker.txt && git symbolic-ref --short HEAD" 2>&1)" \
+  && [ "$out" = "$(printf 'marker\nfeat/x')" ] && pass "after resume: same host key accepted, files and branch intact" || fail "after resume: $out"
+set +e
+payload destroy "$ENV_INST" "$TMP/env1.json" | (cd "$TMP" && HOME="$FAKE_HOME" ORCA_VM_MODE=destroy ORCA_VM_INSTANCE_ID="$ENV_INST" "$WRAPPER" env destroy >/dev/null 2>"$TMP/destroy.log")
+code=$?
+set -e
+[ "$code" = 0 ] && ! docker container inspect "$ENV_CONTAINER" >/dev/null 2>&1 && [ ! -e "$k1" ] && pass "destroy removes the container and its client key" \
+  || fail "destroy exit $code: $(tail -3 "$TMP/destroy.log")"
+! ssh-keygen -F "[127.0.0.1]:$p1" -f "$FAKE_HOME/.ssh/known_hosts" 2>/dev/null | grep -q '^\[' && ssh-keygen -F "[127.0.0.1]:$p2" -f "$FAKE_HOME/.ssh/known_hosts" 2>/dev/null | grep -q '^\[' \
+  && pass "destroy dropped only that endpoint's known_hosts line (other environment's kept)" || fail "known_hosts after destroy: $(cat "$FAKE_HOME/.ssh/known_hosts")"
+(cd "$TMP" && HOME="$FAKE_HOME" "$WRAPPER" env destroy "$ENV_CONTAINER2" >/dev/null 2>&1) && ! docker container inspect "$ENV_CONTAINER2" >/dev/null 2>&1 \
+  && pass "env destroy <container> by hand" || fail "manual destroy"
+(cd "$TMP" && HOME="$FAKE_HOME" ORCA_VM_INSTANCE_ID="$ENV_INST" "$WRAPPER" env destroy </dev/null >/dev/null 2>&1) && pass "destroy of a gone instance is a no-op success" || fail "destroy of gone instance failed"
 
 echo "== --print-config"
 cfg="$(cd "$WORKTREE" && HOME="$FAKE_HOME" ORCA_TAB_ID=cfg "$WRAPPER" --print-config claude --model opus)"

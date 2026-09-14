@@ -1,0 +1,14 @@
+# Orca per-workspace environment recipe backed by orca-docker (local Docker over SSH).
+# Copy this block and scripts/orca-vm/orca-docker.sh into your repository (primary branch), then
+# create a worktree in Orca and pick "orca-docker" under "Run on".
+environmentRecipes:
+  - id: orca-docker
+    name: orca-docker (local desktop container)
+    description: One retained Linux desktop container per worktree; Orca's files, git, terminals and agents run inside it over SSH. Nothing from the host is mounted.
+    # The container clones the repo itself at the exact commit Orca pinned. Remove this line to let
+    # Orca create a linked worktree inside the container instead (schema 1).
+    checkoutMode: provisioned-root
+    create: ./scripts/orca-vm/orca-docker.sh create
+    suspend: ./scripts/orca-vm/orca-docker.sh suspend
+    resume: ./scripts/orca-vm/orca-docker.sh resume
+    destroy: ./scripts/orca-vm/orca-docker.sh destroy

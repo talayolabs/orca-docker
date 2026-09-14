@@ -76,7 +76,9 @@ esac
 "$@"
 code=$?
 
-# Make the session's work visible outside the container before the wrapper stops it.
+# Make the session's work visible outside the container before the wrapper stops it. Not in a
+# workspace environment: there Orca's own git UI runs inside the container, nothing to hand over.
+[ -f "$run_dir/env-mode" ] && ORCA_DOCKER_PUBLISH=off
 if [ "${ORCA_DOCKER_PUBLISH:-local}" != off ] && git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
   if [ "${ORCA_DOCKER_AUTOCOMMIT:-0}" = 1 ]; then
     orca-docker publish --auto --commit "wip: uncommitted changes from orca-docker session" || true

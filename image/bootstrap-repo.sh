@@ -13,6 +13,8 @@
 #   ORCA_DOCKER_BRANCH                  branch the agent works on (created at BASE)
 #   ORCA_DOCKER_ORIGIN                  host repo's origin URL (recorded as `origin`; may be empty)
 #   ORCA_DOCKER_DIRTY_REF               name of the throwaway ref carrying uncommitted changes
+#   ORCA_DOCKER_SEED_REF                environment mode: the bundle holds only this throwaway branch at BASE
+#                                       (no HEAD), so the clone starts from it instead of the bundle's HEAD
 set -euo pipefail
 
 uid="${ORCA_DOCKER_UID:-1000}"; gid="${ORCA_DOCKER_GID:-1000}"
@@ -34,7 +36,12 @@ chown -R "$uid:$gid" "$seed"
 if [ -f "$seed/repo.bundle" ]; then
   base="${ORCA_DOCKER_BASE:?}"
   branch="${ORCA_DOCKER_BRANCH:?}"
-  as_user git clone -q "$seed/repo.bundle" "$repo"
+  seed_ref="${ORCA_DOCKER_SEED_REF:-}"
+  if [ -n "$seed_ref" ]; then
+    as_user git clone -q --no-checkout -b "$seed_ref" "$seed/repo.bundle" "$repo"
+  else
+    as_user git clone -q "$seed/repo.bundle" "$repo"
+  fi
   cd "$repo"
   if [ -n "${ORCA_DOCKER_ORIGIN:-}" ]; then
     as_user git remote set-url origin "$ORCA_DOCKER_ORIGIN"
@@ -45,6 +52,14 @@ if [ -f "$seed/repo.bundle" ]; then
     as_user git branch -q "$ORCA_DOCKER_BASE_BRANCH" "$base" 2>/dev/null || true
   fi
   as_user git checkout -q -B "$branch" "$base"
+  if [ -n "$seed_ref" ]; then
+    as_user git branch -q -D "$seed_ref" 2>/dev/null || true
+    as_user git branch -q -rd "origin/$seed_ref" 2>/dev/null || true
+    if [ -n "${ORCA_DOCKER_ORIGIN:-}" ] && [ -n "${ORCA_DOCKER_BASE_BRANCH:-}" ]; then
+      as_user git update-ref "refs/remotes/origin/$ORCA_DOCKER_BASE_BRANCH" "$base"
+      as_user git branch -q --set-upstream-to="origin/$ORCA_DOCKER_BASE_BRANCH" "$ORCA_DOCKER_BASE_BRANCH" 2>/dev/null || true
+    fi
+  fi
   dirty="${ORCA_DOCKER_DIRTY_REF:-orca-docker-seed-dirty}"
   if as_user git show-ref -q --verify "refs/remotes/origin/$dirty"; then
     # Replay the host's uncommitted changes as uncommitted changes (tracked + untracked, no ignored files).

@@ -12,6 +12,9 @@
 # session's commits leave the container only through `orca-docker publish` (git bundle
 # handed to the host). The container user is created at start time with the host's
 # UID/GID/HOME so paths and commit identity line up.
+# In environment mode (`orca-docker env`, an Orca per-workspace recipe) the container also
+# runs sshd so Orca can make it the workspace's execution host (file tree, git, terminals,
+# agents all run inside). Host keys are generated per container on first start.
 # Repos customize by building `FROM` this image (see examples/repo-dockerfile).
 
 ARG BASE_IMAGE=debian:bookworm-slim
@@ -28,13 +31,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl wget gnupg git openssh-client sudo jq less procps psmisc \
+      ca-certificates curl wget gnupg git openssh-client openssh-server sudo jq less procps psmisc \
       python3 python3-pip python3-venv build-essential pkg-config unzip zip xz-utils \
       locales tzdata dbus-x11 util-linux tini \
       xvfb x11vnc novnc websockify xdotool scrot xclip wmctrl x11-utils x11-xserver-utils \
       xfce4 xfce4-terminal mousepad fonts-dejavu fonts-liberation fonts-noto-color-emoji \
       chromium imagemagick \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
 # Node.js from NodeSource; pnpm/yarn through corepack.
 RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
@@ -52,7 +55,9 @@ COPY mcp.json /opt/orca-docker/mcp.json
 COPY entrypoint.sh supervisor.sh run-agent.sh bootstrap-repo.sh outbox-wait.sh /opt/orca-docker/
 COPY orca-docker-cli.sh /usr/local/bin/orca-docker
 COPY chromium-wrapper.sh /usr/local/bin/chromium-wrapper
+COPY profile.sh /etc/profile.d/orca-docker.sh
 RUN chmod 755 /opt/orca-docker/*.sh /usr/local/bin/orca-docker /usr/local/bin/chromium-wrapper \
+    && printf '\n[ -f /etc/profile.d/orca-docker.sh ] && . /etc/profile.d/orca-docker.sh\n' >> /etc/bash.bashrc \
     && ln -sf /usr/local/bin/chromium-wrapper /usr/local/bin/google-chrome \
     && ln -sf /usr/local/bin/chromium-wrapper /usr/local/bin/chrome
 

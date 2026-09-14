@@ -23,12 +23,24 @@
 #     orca-docker --build                     # build the default image from this checkout
 #     orca-docker --fresh claude              # discard this tab's container and start over
 #
+# Per-workspace environment (Orca "Run on" recipe, see orca.yaml at the repo root): one container per
+# Orca worktree, with sshd, so Orca's file tree, editor, git, search, terminals and agents all
+# run *inside* the container. Orca calls these from the recipe; they speak Orca's recipe protocol
+# (ORCA_VM_* / ORCA_REPO_* environment in, one JSON result on stdout, lifecycle payload on stdin):
+#     orca-docker env create                  # create + start the container, clone the repo, print the SSH result
+#     orca-docker env suspend|resume|destroy  # stop / start / remove it (Orca passes the instance on stdin)
+#     orca-docker env ls                      # list environment containers
+#     orca-docker env destroy <container>     # remove one by hand
+# Inside such a container `orca-docker claude` is the agent launcher and admits one agent per
+# workspace (a second agent tab exits with a message: create another workspace instead).
+#
 # Configuration (environment variables, all optional):
 #   ORCA_DOCKER_IMAGE           explicit image to use (highest priority)
 #   ORCA_DOCKER_DOCKERFILE      Dockerfile to build the per-repo image from
 #                               (default: <worktree>/docker/Dockerfile, then <worktree>/.orca-docker/Dockerfile)
 #   ORCA_DOCKER_DEFAULT_IMAGE   fallback image (default: ghcr.io/talayolabs/orca-docker:latest)
-#   ORCA_DOCKER_NETWORK         host (default on Linux) | bridge
+#   ORCA_DOCKER_NETWORK         host (default on Linux) | bridge   (environments default to bridge)
+#   ORCA_DOCKER_STATE_DIR       host dir for environment SSH keys (default ~/.local/state/orca-docker)
 #   ORCA_DOCKER_BRANCH          in-container working branch (default: orca/<tab>)
 #   ORCA_DOCKER_PUBLISH         local | push (default when origin exists) | pr | off
 #                               local: fetch into the host repo; push: + push to origin; pr: + open a PR with gh
@@ -61,6 +73,7 @@ container_name() { echo "orca-docker-$(slugify "$1")"; }
 # Mode dispatch
 # ---------------------------------------------------------------------------
 MODE=run
+ENV_CMD=""
 FRESH="${ORCA_DOCKER_FRESH:-0}"
 BUILD_ARGS=()
 GC_ALL=0
@@ -78,6 +91,7 @@ while [ $# -gt 0 ]; do
     --fresh) FRESH=1; shift ;;
     --shell) MODE=run; set -- bash "${@:2}"; break ;;
     --print-config) MODE=print; shift ;;
+    env) MODE="env"; ENV_CMD="${2:-}"; shift; [ $# -gt 0 ] && shift; break ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (agent arguments go after the agent name)" ;;
     *) break ;;
@@ -94,7 +108,7 @@ case "$MODE" in
     ;;
   sessions)
     docker ps -a --filter "label=$LABEL" \
-      --format 'table {{.Names}}\t{{.Status}}\t{{.Label "orca-docker.branch"}}\t{{.Label "orca-docker.worktree"}}'
+      --format 'table {{.Names}}\t{{.Status}}\t{{.Label "orca-docker.kind"}}\t{{.Label "orca-docker.branch"}}\t{{.Label "orca-docker.worktree"}}'
     exit 0
     ;;
   rm)
@@ -111,26 +125,30 @@ case "$MODE" in
     days="${ORCA_DOCKER_GC_DAYS:-14}"
     now="$(date +%s)"
     removed=0
-    while IFS=' ' read -r id name finished; do
+    while IFS=' ' read -r id name finished kind; do
       [ -n "$id" ] || continue
+      [ "$kind" != env ] || continue  # workspace environments belong to Orca: `orca-docker env destroy`
       if [ "$GC_ALL" != 1 ]; then
         fin="$(date -d "$finished" +%s 2>/dev/null || echo "$now")"
         [ $(( now - fin )) -ge $(( days * 86400 )) ] || continue
       fi
       docker rm -f "$id" >/dev/null && { log "removed $name"; removed=$((removed + 1)); }
     done < <(docker ps -a --filter "label=$LABEL" --filter status=exited --filter status=created --filter status=dead -q |
-             xargs -r docker inspect --format '{{.Id}} {{.Name}} {{.State.FinishedAt}}')
+             xargs -r docker inspect --format '{{.Id}} {{.Name}} {{.State.FinishedAt}} {{index .Config.Labels "orca-docker.kind"}}')
     [ "$removed" -gt 0 ] || log "nothing to clean (stopped sessions are kept ${days} days; use --gc --all to remove them now)"
     exit 0
     ;;
 esac
 
-[ $# -gt 0 ] || { usage; die "missing agent command (e.g. orca-docker claude)"; }
+[ "$MODE" = env ] || [ $# -gt 0 ] || { usage; die "missing agent command (e.g. orca-docker claude)"; }
 
 # ---------------------------------------------------------------------------
 # Identity: worktree, user, Orca tab
 # ---------------------------------------------------------------------------
 WORKTREE="$(pwd -P)"
+if [ "$MODE" = env ] && [ -n "${ORCA_REPO_PATH:-}" ]; then
+  WORKTREE="$(cd "$ORCA_REPO_PATH" 2>/dev/null && pwd -P)" || die "ORCA_REPO_PATH does not exist: $ORCA_REPO_PATH"
+fi
 [ -d "$WORKTREE" ] || die "cwd does not exist: $WORKTREE"
 case "$WORKTREE" in /) die "refusing to use / as the worktree" ;; esac
 
@@ -145,7 +163,13 @@ hash_mod() {  # hash_mod <string> <modulus>
 }
 
 TAB_ID="${ORCA_TAB_ID:-}"
-if [ -n "$TAB_ID" ]; then
+if [ "$MODE" = env ]; then
+  # One container per Orca workspace: keyed by the recipe instance Orca hands us (stable across
+  # create/suspend/resume/destroy), readable thanks to the workspace name.
+  ENV_INSTANCE="${ORCA_VM_INSTANCE_ID:-manual-$(date +%s)-$$}"
+  ENV_WORKSPACE="${ORCA_WORKSPACE_NAME:-$(basename "$WORKTREE")}"
+  SESSION_KEY="env-$(slugify "$ENV_WORKSPACE" | cut -c1-24)-$(printf '%s' "${ENV_INSTANCE#orca-}" | tr -cd 'A-Za-z0-9' | cut -c1-8)"
+elif [ -n "$TAB_ID" ]; then
   SESSION_KEY="$TAB_ID"
 else
   # Standalone: one session per directory, so `orca-docker claude` in the same repo resumes.
@@ -153,7 +177,8 @@ else
 fi
 SLUG="$(slugify "$SESSION_KEY")"
 CONTAINER="$(container_name "$SESSION_KEY")"
-BRANCH="${ORCA_DOCKER_BRANCH:-orca/${SLUG}}"
+BRANCH="${ORCA_DOCKER_BRANCH:-${ORCA_REPO_BRANCH:-orca/${SLUG}}}"
+STATE_DIR="${ORCA_DOCKER_STATE_DIR:-${XDG_STATE_HOME:-$HOST_HOME/.local/state}/orca-docker}"
 
 # ---------------------------------------------------------------------------
 # Networking + ports. With --network host every container shares the host's
@@ -163,7 +188,9 @@ BRANCH="${ORCA_DOCKER_BRANCH:-orca/${SLUG}}"
 UNAME="$(uname -s)"
 NETWORK="${ORCA_DOCKER_NETWORK:-}"
 if [ -z "$NETWORK" ]; then
-  case "$UNAME" in Linux) NETWORK=host ;; *) NETWORK=bridge ;; esac
+  # Tabs need host networking so the copied hook script reaches Orca on 127.0.0.1; an environment
+  # runs Orca's relay (and hook server) inside, so it can stay on an isolated bridge network.
+  if [ "$MODE" = env ]; then NETWORK=bridge; else case "$UNAME" in Linux) NETWORK=host ;; *) NETWORK=bridge ;; esac; fi
 fi
 
 port_free() {
@@ -181,15 +208,25 @@ display_free() {  # X11 unix sockets live in a shared abstract namespace under -
   fi
 }
 
+ssh_port_free() {  # a port the user's known_hosts already pins to another key would make Orca refuse the new key
+  port_free "$1" || return 1
+  [ "$MODE" = env ] || return 0
+  ! docker ps -a --filter "label=orca-docker.ssh-port=$1" -q 2>/dev/null | grep -q . || return 1
+  if command -v ssh-keygen >/dev/null 2>&1 && [ -f "$HOST_HOME/.ssh/known_hosts" ]; then
+    ! ssh-keygen -F "[127.0.0.1]:$1" -f "$HOST_HOME/.ssh/known_hosts" 2>/dev/null | grep -q .
+  fi
+}
+
 allocate_slots() {
   SLOT="$(hash_mod "$SESSION_KEY" 900)"
   for _ in $(seq 1 60); do
     DISPLAY_NUM=$((100 + SLOT))
     VNC_PORT=$((25000 + SLOT))
     NOVNC_PORT=$((26000 + SLOT))
+    SSH_PORT=$((27000 + SLOT))
     if [ "$NETWORK" != host ]; then
-      port_free "$NOVNC_PORT" && break
-    elif port_free "$VNC_PORT" && port_free "$NOVNC_PORT" && display_free "$DISPLAY_NUM"; then
+      port_free "$NOVNC_PORT" && ssh_port_free "$SSH_PORT" && break
+    elif port_free "$VNC_PORT" && port_free "$NOVNC_PORT" && ssh_port_free "$SSH_PORT" && display_free "$DISPLAY_NUM"; then
       break
     fi
     SLOT=$(( (SLOT + 1) % 900 ))
@@ -254,6 +291,42 @@ if command -v git >/dev/null 2>&1 && git -C "$WORKTREE" rev-parse --git-dir >/de
   ORIGIN="$(git -C "$WORKTREE" remote get-url origin 2>/dev/null || true)"
 fi
 
+SEED_REF=""
+if [ "$MODE" = env ] && [ "$IS_GIT" = 1 ]; then
+  # Provisioned-root contract: check out exactly the commit Orca pinned (ORCA_REPO_REF_HEAD) on
+  # ORCA_REPO_BRANCH; never re-resolve the moving ref. Falls back to the checkout's HEAD when Orca
+  # runs the recipe in orca-worktree mode (no pinned source).
+  if [ -n "${ORCA_REPO_REF_HEAD:-}" ]; then
+    if ! git -C "$WORKTREE" cat-file -e "${ORCA_REPO_REF_HEAD}^{commit}" 2>/dev/null && [ -n "${ORCA_REPO_URL:-}" ]; then
+      # ORCA_REPO_URL/ORCA_REPO_REF are the matched pair Orca resolved the pin against (objects only;
+      # no host ref is created or moved).
+      log "fetching ${ORCA_REPO_REF:-HEAD} from $ORCA_REPO_URL for pinned commit ${ORCA_REPO_REF_HEAD:0:7}"
+      GIT_TERMINAL_PROMPT=0 git -C "$WORKTREE" fetch -q "$ORCA_REPO_URL" "${ORCA_REPO_REF:-HEAD}" >&2 || true
+    fi
+    git -C "$WORKTREE" cat-file -e "${ORCA_REPO_REF_HEAD}^{commit}" 2>/dev/null \
+      || die "pinned commit $ORCA_REPO_REF_HEAD is not in $WORKTREE (fetch it first)"
+    BASE="$(git -C "$WORKTREE" rev-parse --verify -q "${ORCA_REPO_REF_HEAD}^{commit}")"
+  fi
+  ref="${ORCA_REPO_REF:-}"
+  case "$ref" in
+    refs/heads/*) BASE_BRANCH="${ref#refs/heads/}" ;;
+    refs/remotes/*) BASE_BRANCH="${ref#refs/remotes/}"; BASE_BRANCH="${BASE_BRANCH#*/}" ;;
+    "") ;;
+    *)
+      if git -C "$WORKTREE" show-ref -q --verify "refs/remotes/$ref"; then BASE_BRANCH="${ref#*/}"   # origin/main
+      elif [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]] && ! git -C "$WORKTREE" show-ref -q --verify "refs/heads/$ref"; then BASE_BRANCH=""
+      else BASE_BRANCH="$ref"; fi ;;
+  esac
+  [ "$BASE_BRANCH" != "$BRANCH" ] || BASE_BRANCH=""
+  [ -z "${ORCA_REPO_URL:-}" ] || ORIGIN="$ORCA_REPO_URL"
+  SEED_REF="orca-docker-seed-${SLUG}"
+  if [ "${ORCA_RECIPE_RESULT_SCHEMA_VERSION:-2}" = 1 ] && [ -z "${ORCA_DOCKER_BRANCH:-}" ]; then
+    # orca-worktree mode: Orca adds its own linked worktree for ORCA_REPO_BRANCH inside the
+    # container, so the primary checkout must sit on the base branch, not on that one.
+    BRANCH="${BASE_BRANCH:-orca-docker/primary}"
+  fi
+fi
+
 PUBLISH="${ORCA_DOCKER_PUBLISH:-}"
 if [ -z "$PUBLISH" ]; then
   if [ -n "$ORIGIN" ]; then PUBLISH=push; else PUBLISH=local; fi
@@ -283,12 +356,24 @@ build_create_cmd() {
   for name in ORCA_DOCKER_DESKTOP ORCA_DOCKER_DISPLAY_SIZE; do
     [ -n "${!name:-}" ] && CREATE+=(-e "$name")
   done
+  if [ "$MODE" = env ]; then
+    CREATE+=(--label orca-docker.kind=env
+      --label "orca-docker.instance=${ENV_INSTANCE}"
+      --label "orca-docker.workspace=${ENV_WORKSPACE}"
+      --label "orca-docker.workspace-id=${ORCA_WORKSPACE_ID:-}"
+      --label "orca-docker.ssh-port=${SSH_PORT}"
+      --label "orca-docker.ssh-key=${ENV_KEY}"
+      --label "orca-docker.checkout-mode=${ENV_CHECKOUT_MODE}"
+      -e ORCA_DOCKER_SSH_PUBKEY="$(cat "$ENV_KEY.pub")")
+  fi
   if [ "$NETWORK" = host ]; then
     CREATE+=(--network host -e ORCA_DOCKER_BIND=127.0.0.1)
+    [ "$MODE" != env ] || CREATE+=(-e ORCA_DOCKER_SSH_PORT="$SSH_PORT" -e ORCA_DOCKER_SSH_BIND=127.0.0.1)
   else
     CREATE+=(--network "$NETWORK" -e ORCA_DOCKER_BIND=0.0.0.0
              -p "127.0.0.1:${NOVNC_PORT}:${NOVNC_PORT}"
              --add-host host.docker.internal:host-gateway)
+    [ "$MODE" != env ] || CREATE+=(-p "127.0.0.1:${SSH_PORT}:22")
   fi
   if [ -n "${ORCA_DOCKER_ARGS:-}" ]; then
     # shellcheck disable=SC2206
@@ -353,15 +438,23 @@ copy_in_if_newer() {  # only replace the container's copy when the host file cha
   return 0
 }
 
+SEED_TMP=""
+trap '[ -z "$SEED_TMP" ] || rm -rf "$SEED_TMP"' EXIT
 seed_repo() {
   local tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/orca-docker-seed.XXXXXX")"
-  trap 'rm -rf "$tmp"' RETURN
+  SEED_TMP="$tmp"
   if [ "$IS_GIT" = 1 ]; then
     # Per-session ref name: concurrent tabs of the same worktree bundle at the same time.
     local refs=(HEAD) dirty_ref="refs/heads/orca-docker-seed-dirty-${SLUG}"
-    [ -n "$BASE_BRANCH" ] && refs+=("refs/heads/$BASE_BRANCH")
-    if [ "${ORCA_DOCKER_CARRY_CHANGES:-1}" != 0 ] && [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null)" ]; then
+    if [ -n "$SEED_REF" ]; then
+      # Environment: the pinned commit travels under a throwaway branch (bundles carry refs, not shas).
+      git -C "$WORKTREE" update-ref "refs/heads/$SEED_REF" "$BASE"
+      refs=("refs/heads/$SEED_REF")
+    elif [ -n "$BASE_BRANCH" ]; then
+      refs+=("refs/heads/$BASE_BRANCH")
+    fi
+    if [ "$MODE" != env ] && [ "${ORCA_DOCKER_CARRY_CHANGES:-1}" != 0 ] && [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null)" ]; then
       # Snapshot tracked + untracked (non-ignored) changes as a throwaway commit so the clone
       # starts with the same uncommitted changes; the ref is removed from the host right after.
       local idx tree commit
@@ -378,6 +471,7 @@ seed_repo() {
     fi
     git -C "$WORKTREE" bundle create -q "$tmp/repo.bundle" "${refs[@]}" || die "could not bundle the repository"
     git -C "$WORKTREE" update-ref -d "$dirty_ref" 2>/dev/null || true
+    [ -z "$SEED_REF" ] || git -C "$WORKTREE" update-ref -d "refs/heads/$SEED_REF" 2>/dev/null || true
   else
     log "warning: $WORKTREE is not a git repository (or has no commits): copying it as-is; publishing is disabled"
     tar -C "$WORKTREE" --exclude=./node_modules --exclude=./.venv -cf "$tmp/repo.tar" .
@@ -388,7 +482,9 @@ seed_repo() {
     -e ORCA_DOCKER_UID="$HOST_UID" -e ORCA_DOCKER_GID="$HOST_GID" -e ORCA_DOCKER_HOME="$HOST_HOME" \
     -e ORCA_DOCKER_REPO="$WORKTREE" -e ORCA_DOCKER_BASE="$BASE" -e ORCA_DOCKER_BASE_BRANCH="$BASE_BRANCH" \
     -e ORCA_DOCKER_BRANCH="$BRANCH" -e ORCA_DOCKER_ORIGIN="$ORIGIN" -e ORCA_DOCKER_DIRTY_REF="orca-docker-seed-dirty-${SLUG}" \
+    -e ORCA_DOCKER_SEED_REF="$SEED_REF" \
     "$CONTAINER" /opt/orca-docker/bootstrap-repo.sh || die "repository bootstrap failed"
+  rm -rf "$tmp"; SEED_TMP=""
 }
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOST_HOME/.claude}"
@@ -512,6 +608,179 @@ wait_ready() {
   done
   log "warning: container did not report ready in 30s; continuing"
 }
+
+# ---------------------------------------------------------------------------
+# Environment mode: Orca's per-workspace recipe protocol (examples/orca.yaml)
+#   create           -> container + clone, then the SSH connection result as JSON on stdout
+#   suspend/resume   -> docker stop / start (resume re-emits the result)
+#   destroy          -> docker rm (the only time an environment container is removed)
+# Everything else the container prints goes to stderr; stdout is the protocol.
+# ---------------------------------------------------------------------------
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+env_label() { docker container inspect -f "{{index .Config.Labels \"orca-docker.$2\"}}" "$1" 2>/dev/null || true; }
+
+env_payload_field() {  # env_payload_field <payload> <field>  (only our own userData is ever parsed)
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$1" | jq -r ".recipeResult.userData.$2 // empty" 2>/dev/null
+  else
+    printf '%s' "$1" | sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p"
+  fi
+}
+
+env_find_container() {  # explicit name/instance argument > ORCA_VM_INSTANCE_ID > lifecycle payload on stdin
+  local cand payload=""
+  for cand in "${1:-}" "${ORCA_VM_INSTANCE_ID:-}"; do
+    [ -n "$cand" ] || continue
+    if docker container inspect "$cand" >/dev/null 2>&1; then echo "$cand"; return 0; fi
+    cand="$(docker ps -a --filter "label=orca-docker.instance=$cand" --format '{{.Names}}' | head -1)"
+    [ -z "$cand" ] || { echo "$cand"; return 0; }
+  done
+  [ -t 0 ] || payload="$(cat)"
+  for cand in "$(env_payload_field "$payload" container)" "$(env_payload_field "$payload" instance)"; do
+    [ -n "$cand" ] || continue
+    if docker container inspect "$cand" >/dev/null 2>&1; then echo "$cand"; return 0; fi
+    cand="$(docker ps -a --filter "label=orca-docker.instance=$cand" --format '{{.Names}}' | head -1)"
+    [ -z "$cand" ] || { echo "$cand"; return 0; }
+  done
+  return 1
+}
+
+USER_KNOWN_HOSTS="$HOST_HOME/.ssh/known_hosts"
+# The container's host key is read over `docker exec` (a trusted channel) and recorded for its
+# endpoint in the user's known_hosts, as Orca's local-Docker guidance asks, so Orca verifies the
+# key instead of trusting first contact. Ports are only ever reused by our own containers (see
+# ssh_port_free), so the previous entry for the endpoint is one we wrote for a destroyed container.
+env_record_host_key() {  # env_record_host_key <container> <port>
+  local c="$1" port="$2" pub line hk="$STATE_DIR/$1.hostkey"
+  pub="$(docker exec "$c" cat /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $1" "$2}')"
+  [ -n "$pub" ] || { log "warning: could not read the container's ssh host key"; return 0; }
+  line="[127.0.0.1]:$port $pub"
+  printf '%s\n' "$line" > "$hk"
+  printf '%s\n' "$line" > "$STATE_DIR/$c.known_hosts"
+  install -d -m 700 "$(dirname "$USER_KNOWN_HOSTS")"
+  [ -f "$USER_KNOWN_HOSTS" ] || { : > "$USER_KNOWN_HOSTS"; chmod 600 "$USER_KNOWN_HOSTS"; }
+  if ssh-keygen -F "[127.0.0.1]:$port" -f "$USER_KNOWN_HOSTS" 2>/dev/null | grep -qF "$pub"; then return 0; fi
+  ssh-keygen -q -R "[127.0.0.1]:$port" -f "$USER_KNOWN_HOSTS" >/dev/null 2>&1 || true
+  rm -f "$USER_KNOWN_HOSTS.old"
+  printf '%s\n' "$line" >> "$USER_KNOWN_HOSTS"
+}
+
+env_forget_host_key() {  # env_forget_host_key <container>: drop our known_hosts line only if it is still ours
+  local hk="$STATE_DIR/$1.hostkey" line
+  [ -f "$hk" ] || return 0
+  line="$(cat "$hk")"
+  if [ -f "$USER_KNOWN_HOSTS" ] && grep -qxF "$line" "$USER_KNOWN_HOSTS"; then
+    grep -vxF "$line" "$USER_KNOWN_HOSTS" > "$USER_KNOWN_HOSTS.orca-docker.tmp" || true
+    cat "$USER_KNOWN_HOSTS.orca-docker.tmp" > "$USER_KNOWN_HOSTS"; rm -f "$USER_KNOWN_HOSTS.orca-docker.tmp"
+  fi
+  rm -f "$hk" "$STATE_DIR/$1.known_hosts"
+}
+
+env_result_json() {  # env_result_json <container>
+  local c="$1" port key root mode ws inst novnc fp="" user
+  port="$(env_label "$c" ssh-port)"; key="$(env_label "$c" ssh-key)"; root="$(env_label "$c" worktree)"
+  mode="$(env_label "$c" checkout-mode)"; ws="$(env_label "$c" workspace)"; inst="$(env_label "$c" instance)"
+  user="$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | sed -n 's/^ORCA_DOCKER_USER=//p')"
+  novnc="$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | sed -n 's/^ORCA_DOCKER_NOVNC_PORT=//p')"
+  [ ! -f "$STATE_DIR/$c.hostkey" ] || fp="$(ssh-keygen -lf "$STATE_DIR/$c.hostkey" 2>/dev/null | awk '{print $2}')"
+  local head='"schemaVersion":1,'
+  [ "$mode" != provisioned-root ] || head='"schemaVersion":2,"checkoutMode":"provisioned-root",'
+  printf '{%s"connection":{"type":"ssh","projectRoot":%s,"target":{"label":%s,"host":"127.0.0.1","port":%s,"username":%s,"identityFile":%s,"identitiesOnly":true}},"userData":{"container":%s,"instance":%s,"novncUrl":%s,"hostKeyFingerprint":%s}}\n' \
+    "$head" "$(json_str "$root")" "$(json_str "orca-docker ${ws:-$c}")" "$port" "$(json_str "${user:-$HOST_USER}")" "$(json_str "$key")" \
+    "$(json_str "$c")" "$(json_str "$inst")" "$(json_str "http://127.0.0.1:${novnc}/vnc.html?autoconnect=1&resize=scale")" "$(json_str "$fp")"
+}
+
+env_wait_ssh() {  # env_wait_ssh <container> <port> <key> <user>
+  local c="$1" port="$2" key="$3" user="$4" kh="$STATE_DIR/$1.known_hosts" i
+  for i in $(seq 1 120); do
+    if command -v ssh >/dev/null 2>&1 && [ -s "$kh" ]; then
+      if ssh -q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$kh" \
+             -o ConnectTimeout=3 -o IdentitiesOnly=yes -i "$key" -p "$port" "$user@127.0.0.1" true 2>/dev/null; then
+        return 0
+      fi
+    elif (exec 3<>"/dev/tcp/127.0.0.1/$port" && head -c 4 <&3 | grep -q SSH) 2>/dev/null; then
+      return 0
+    fi
+    [ "$(container_state)" = running ] || die "container $c stopped: $(docker logs --tail 20 "$c" 2>&1 | tail -5)"
+    [ "$i" -lt 120 ] || { log "warning: sshd on 127.0.0.1:$port did not answer in 60s ($(docker exec "$c" tail -3 /run/orca-docker/sshd.log 2>/dev/null | tr '\n' ' '))"; return 1; }
+    sleep 0.5
+  done
+}
+
+env_create() {
+  local state
+  command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen (openssh client) is required on the host for environment mode"
+  ENV_CHECKOUT_MODE=orca-worktree
+  [ "${ORCA_RECIPE_RESULT_SCHEMA_VERSION:-2}" = 1 ] || ENV_CHECKOUT_MODE=provisioned-root
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  ENV_KEY="$STATE_DIR/$CONTAINER.ed25519"
+  state="$(container_state)"
+  if [ "$state" != absent ] && [ "$FRESH" = 1 ]; then
+    log "discarding $CONTAINER (--fresh)"; docker rm -f "$CONTAINER" >/dev/null; state=absent
+  fi
+  if [ "$state" = absent ]; then
+    rm -f "$ENV_KEY" "$ENV_KEY.pub" "$STATE_DIR/$CONTAINER.known_hosts" "$STATE_DIR/$CONTAINER.hostkey"
+    ssh-keygen -q -t ed25519 -N '' -C "orca-docker $CONTAINER" -f "$ENV_KEY"
+    ensure_image
+    allocate_slots
+    build_create_cmd env
+    log "new environment $CONTAINER  workspace ${ENV_WORKSPACE}  image $IMAGE  branch $BRANCH  base ${BASE:-none}  ssh 127.0.0.1:$SSH_PORT"
+    "${CREATE[@]}" >/dev/null
+    docker start "$CONTAINER" >/dev/null
+    wait_ready
+    seed_agent_state
+    seed_repo
+  else
+    # Orca retried create for an instance we already have: idempotent.
+    [ -f "$ENV_KEY" ] || die "environment $CONTAINER exists but its SSH key $ENV_KEY is gone; run: orca-docker env destroy $CONTAINER"
+    [ "$state" = running ] || docker start "$CONTAINER" >/dev/null
+    wait_ready
+  fi
+  SSH_PORT="$(env_label "$CONTAINER" ssh-port)"
+  env_record_host_key "$CONTAINER" "$SSH_PORT"
+  env_wait_ssh "$CONTAINER" "$SSH_PORT" "$(env_label "$CONTAINER" ssh-key)" "$HOST_USER" ||
+    die "sshd in $CONTAINER is not reachable on 127.0.0.1:$SSH_PORT (container kept; docker logs $CONTAINER)"
+  env_result_json "$CONTAINER" >&3
+}
+
+if [ "$MODE" = env ]; then
+  exec 3>&1 1>&2   # stdout is the recipe protocol; everything else (docker cp chatter, logs) goes to stderr
+  case "$ENV_CMD" in
+    create) env_create ;;
+    resume)
+      c="$(env_find_container "${1:-}")" || die "no environment container for this instance (destroyed? see: orca-docker env ls)"
+      [ "$(docker container inspect -f '{{.State.Status}}' "$c")" = running ] || docker start "$c" >/dev/null
+      CONTAINER="$c"; wait_ready
+      env_record_host_key "$c" "$(env_label "$c" ssh-port)"
+      env_wait_ssh "$c" "$(env_label "$c" ssh-port)" "$(env_label "$c" ssh-key)" "$HOST_USER" ||
+        die "sshd in $c is not reachable on 127.0.0.1:$(env_label "$c" ssh-port) (container kept; docker logs $c)"
+      env_result_json "$c" >&3
+      ;;
+    suspend)
+      c="$(env_find_container "${1:-}")" || die "no environment container for this instance"
+      docker stop -t 10 "$c" >/dev/null; log "suspended $c (container kept)"
+      ;;
+    destroy|rm)
+      c="$(env_find_container "${1:-}")" || { log "nothing to destroy for this instance"; exit 0; }
+      key="$(env_label "$c" ssh-key)"
+      docker rm -f "$c" >/dev/null
+      env_forget_host_key "$c"
+      [ -z "$key" ] || rm -f "$key" "$key.pub"
+      log "destroyed environment $c"
+      ;;
+    status|show)
+      c="$(env_find_container "${1:-}")" || die "no environment container for this instance"
+      docker container inspect -f '{{.Name}}  {{.State.Status}}  workspace={{index .Config.Labels "orca-docker.workspace"}}  ssh=127.0.0.1:{{index .Config.Labels "orca-docker.ssh-port"}}  branch={{index .Config.Labels "orca-docker.branch"}}  repo={{index .Config.Labels "orca-docker.worktree"}}' "$c" >&3
+      env_result_json "$c" >&3
+      ;;
+    ls|list|"")
+      docker ps -a --filter "label=orca-docker.kind=env" \
+        --format 'table {{.Names}}\t{{.Status}}\t{{.Label "orca-docker.workspace"}}\t127.0.0.1:{{.Label "orca-docker.ssh-port"}}\t{{.Label "orca-docker.branch"}}\t{{.Label "orca-docker.worktree"}}' >&3
+      ;;
+    *) die "unknown env command: $ENV_CMD (create|suspend|resume|destroy|status|ls)" ;;
+  esac
+  exit 0
+fi
 
 STATE="$(container_state)"
 if [ "$FRESH" = 1 ] && [ "$STATE" != absent ]; then

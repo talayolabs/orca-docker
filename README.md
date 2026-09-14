@@ -1,13 +1,134 @@
 # orca-docker
 
-Run each [Orca](https://github.com/stablyai/orca) agent tab inside its own Linux desktop
-container — a persistent "PC" per session with a virtual display, XFCE, Chromium, noVNC and
+Run [Orca](https://github.com/stablyai/orca) coding sessions inside their own Linux desktop
+containers — a persistent "PC" per session with a virtual display, XFCE, Chromium, noVNC and
 a computer-use MCP server — **without mounting anything from the host**. The container gets
-its own clone of the repository; the session's work comes back as a git branch (and pull
-request) that the wrapper announces in the Orca pane. Orca keeps working as before (status
-hooks, resume).
+its own clone of the repository; the host checkout is never touched.
+
+Two ways to use it:
+
+| | **Per-worktree environment** (recommended) | **Per-tab wrapper** (legacy) |
+| --- | --- | --- |
+| Unit of isolation | one container per Orca worktree, selected as *Run on: orca-docker* | one container per agent tab |
+| Where Orca's tools run | inside the container over SSH: file tree, editor, search, git status/diff, watchers, terminals, agents | on the host (they show the host checkout, not the container's) |
+| Agents per container | one (`orca-docker claude` refuses a second) | one per tab |
+| Getting work out | Orca's own commit / push / PR UI, inside the container | `orca-docker publish` → `orca/<tab>` branch on the host, pushed / PR'd |
+| Setup | `orca.yaml` recipe in the repo | Orca agent command override |
+| See | [Per-worktree environments](#per-worktree-environments-orca-recipe) | [Per-tab wrapper](#per-tab-wrapper-orca-command-override) |
 
 Claude Code is the first supported agent. The wrapper is agent-agnostic; more agents later.
+
+```
+ Orca (host)                                    container: orca-docker-env-<workspace>-<id>   (kept, no --rm)
+ ┌───────────────────────────────────┐          ┌────────────────────────────────────────────────┐
+ │ worktree "Run on: orca-docker"    │          │ sshd (key-only, per-container host key)        │
+ │   orca.yaml recipe ─ env create ──┼─ docker ▶│  clone at the same path @ the pinned commit    │
+ │   file tree · editor · search     │   ssh    │  Orca relay: fs, git, watchers, terminals      │
+ │   git · terminals · agent tab  ◀──┼──────────┼▶ orca-docker claude (one agent per container)  │
+ │ commit / push / PR from Orca ─────┼──────────┼▶ git push origin                               │
+ │                                   │          │  supervisor: Xvfb ─ XFCE ─ x11vnc ─ noVNC       │
+ └───────────────────────────────────┘          └────────────────────────────────────────────────┘
+```
+
+## Per-worktree environments (Orca recipe)
+
+Orca's [per-workspace environments](https://github.com/stablyai/orca) let a worktree run on a
+remote host over SSH; orca-docker provides that host as a local Docker container. Everything
+Orca does for that worktree — file tree, editor, search, git status and diff, file watching,
+terminals and agent tabs — happens **inside the container**, so what the agent edits is what
+you see, and you commit / push / open PRs with Orca's normal git UI. Nothing is mounted.
+
+### Set up
+
+1. Install orca-docker (below) and make sure `orca-docker` is on `PATH` (or set
+   `ORCA_DOCKER_BIN`; `~/.orca-docker/bin/orca-docker` is also found automatically).
+2. Copy [`orca.yaml`](orca.yaml) (or just its `environmentRecipes` block) and
+   [`scripts/orca-vm/orca-docker.sh`](scripts/orca-vm/orca-docker.sh) into the repository's
+   primary branch and commit them:
+
+   ```yaml
+   environmentRecipes:
+     - id: orca-docker
+       name: orca-docker (local desktop container)
+       checkoutMode: provisioned-root
+       create: ./scripts/orca-vm/orca-docker.sh create
+       suspend: ./scripts/orca-vm/orca-docker.sh suspend
+       resume: ./scripts/orca-vm/orca-docker.sh resume
+       destroy: ./scripts/orca-vm/orca-docker.sh destroy
+   ```
+
+3. In Orca, create a new worktree for the repo and pick **orca-docker** under **Run on**.
+
+Orca runs `create` (a container comes up in ~15 s, plus the clone and dependency install),
+connects over SSH and opens the worktree with the container as its execution host. The
+recipe's stderr shows up in Orca's provisioning log, including the noVNC URL of the desktop.
+
+### What happens
+
+- **Container.** One retained container per worktree, named
+  `orca-docker-env-<workspace>-<instance>`, from the same image resolution as the per-tab
+  wrapper (explicit `ORCA_DOCKER_IMAGE`, repo `docker/Dockerfile`, default image). Bridge
+  networking; `sshd` and noVNC are published on `127.0.0.1` only (ports `27xxx` / `26xxx`).
+- **SSH.** The recipe generates an Ed25519 client key per environment (kept under
+  `~/.local/state/orca-docker/`, mode 600, never in the image) and passes only the public
+  half into the container. `sshd` accepts that key alone: no passwords, no root. Each
+  container generates its own host keys at first start (the image ships none) and keeps them
+  across restarts. The recipe reads the container's host key over `docker exec` — a trusted
+  local channel — and records it for `[127.0.0.1]:<port>` in your `~/.ssh/known_hosts`, so
+  Orca connects with strict host-key verification instead of trusting first contact. The line
+  is removed again on `destroy`.
+- **Repository.** With `checkoutMode: provisioned-root` Orca tells the recipe which commit it
+  pinned (`ORCA_REPO_REF_HEAD`), from which ref/URL, and which branch the worktree should be on.
+  The container gets a fresh clone at the **same absolute path** as the host checkout, checked
+  out to exactly that commit on that branch, with `origin` set so `git fetch`/`push` work. If
+  the pinned commit is not in the host checkout yet (someone pushed), the recipe fetches the
+  objects from `ORCA_REPO_URL` — it never moves a host branch or touches the host working tree.
+  Without `checkoutMode` (schema 1) the container holds the primary checkout on the base
+  branch and Orca adds its own linked worktree inside the container.
+- **Lifecycle.** Containers are created without `--rm`. *Suspend* (Orca's sleep) stops the
+  container; *resume* starts it and re-checks the SSH port and host key — clone, deps, browser
+  profile and agent transcripts survive. Only *destroy* (removing the worktree/environment in
+  Orca, or `orca-docker env destroy <container>`) deletes the container and its client key.
+  `orca-docker --gc` never touches environment containers.
+- **One agent per worktree.** Inside the container, `orca-docker claude` is the agent
+  launcher (Orca applies the command override on the execution host too). It takes a
+  container-local lock: the first agent tab runs, a second one exits immediately with
+  *"this workspace already has a running agent … create another workspace"* (exit 75).
+  Terminal tabs are unaffected. The lock is released when the agent exits and recovers on its
+  own after a crash. Orca's *+ agent* button still exists — the limit is enforced at launch.
+- **No publish protocol.** In environment mode the legacy `orca/<tab>` branch and
+  `orca-docker publish` are disabled; Orca's git UI inside the container is the way out.
+
+### Commands
+
+```sh
+orca-docker env ls                        # environment containers, their workspace, state, SSH port
+orca-docker env status <container>        # re-print one environment's recipe result
+orca-docker env destroy <container>       # remove one by hand (container, client key, known_hosts line)
+```
+
+`create` / `suspend` / `resume` / `destroy` without a name speak Orca's recipe protocol
+(`ORCA_VM_*` / `ORCA_REPO_*` environment in, exactly one JSON result on stdout, lifecycle
+payload on stdin) and are meant to be called by Orca through the shim.
+
+### Limits
+
+- Orca offers recipes for **git repositories only**; folder workspaces use the per-tab
+  wrapper. (`orca-docker env create` itself accepts a plain directory — it is copied as a
+  tarball — for manual use.)
+- Recipes run on the local Docker daemon; on macOS/Windows Docker Desktop the published
+  `127.0.0.1` ports work as on Linux (the loopback caveat of the per-tab wrapper does not apply,
+  since Orca's relay talks to the container over SSH).
+- The container user's home is the same path as yours (`/home/<you>`), and the clone lives at
+  the same absolute path, so anything Orca stores by path lines up. Repositories must therefore
+  live under your home directory (or somewhere the container user may create siblings) for
+  Orca's linked worktrees in schema-1 mode.
+
+## Per-tab wrapper (Orca command override)
+
+The original mode: each Orca agent tab gets its own container while Orca's own tools stay on
+the host. The session's work comes back as a git branch (and pull request) that the wrapper
+announces in the Orca pane. Orca keeps working as before (status hooks, resume).
 
 ```
  Orca (host)                                       container: orca-docker-<tab-id>   (kept, no --rm)
@@ -24,10 +145,12 @@ Claude Code is the first supported agent. The wrapper is agent-agnostic; more ag
 
 ## Requirements
 
-- Linux host with Docker (Docker Desktop on macOS/Windows works with reduced integration, see
-  [Caveats](#caveats)).
-- Orca ≥ a build with per-agent command overrides (Settings → Agents).
-- `bash`, `git` on the host; `gh` for automatic pull requests; `node` only for the smoke test.
+- Linux host with Docker (Docker Desktop on macOS/Windows works; the per-tab wrapper has
+  reduced integration there, see [Caveats](#caveats)).
+- Orca ≥ a build with per-agent command overrides (Settings → Agents); environment recipes
+  need a build with `environmentRecipes` in `orca.yaml` ("Run on" in the new-worktree dialog).
+- `bash`, `git`, `ssh`/`ssh-keygen` on the host; `gh` for automatic pull requests (per-tab
+  mode); `node` only for the smoke test.
 
 ## Install
 
@@ -39,9 +162,10 @@ ln -s ~/.orca-docker/bin/orca-docker ~/.local/bin/orca-docker   # anything on PA
 orca-docker --build
 ```
 
-### Hook it into Orca
+### Hook it into Orca (per-tab wrapper)
 
-In Orca, set the Claude agent **command override** to:
+For per-worktree environments see [above](#per-worktree-environments-orca-recipe). For the
+per-tab wrapper, set the Claude agent **command override** in Orca to:
 
 ```
 orca-docker claude
@@ -159,7 +283,8 @@ All optional, set in the environment Orca launches agents with (or your shell):
 | `ORCA_DOCKER_IMAGE` | — | use this image, skip repo Dockerfile discovery |
 | `ORCA_DOCKER_DOCKERFILE` | auto | per-repo Dockerfile path |
 | `ORCA_DOCKER_DEFAULT_IMAGE` | `ghcr.io/talayolabs/orca-docker:latest` | fallback image |
-| `ORCA_DOCKER_NETWORK` | `host` on Linux, `bridge` elsewhere | docker network mode |
+| `ORCA_DOCKER_NETWORK` | `host` on Linux, `bridge` elsewhere; environments: `bridge` | docker network mode |
+| `ORCA_DOCKER_STATE_DIR` | `~/.local/state/orca-docker` | environment SSH client keys and recorded host keys |
 | `ORCA_DOCKER_BRANCH` | `orca/<tab-id>` | branch the session works on and publishes |
 | `ORCA_DOCKER_PUBLISH` | `push` with an origin, else `local` | `local` / `push` / `pr` / `off` (see above) |
 | `ORCA_DOCKER_AUTOCOMMIT=1` | off | commit leftover changes as `wip:` when publishing on exit |
@@ -233,16 +358,28 @@ files, the container kept (no `--rm`, no mounts) and resumed with its state on r
 `--rm-session`, local-only repos, two concurrent desktops, exit-status and argument
 pass-through, and `--print-config`.
 
+For environments it drives the recipe protocol the way Orca does (`ORCA_VM_*` / `ORCA_REPO_*`
+environment, lifecycle payload on stdin) and asserts: one JSON result on stdout with diagnostics
+on stderr, the provisioned-root clone at the exact pinned commit (also when it only exists on
+`origin`) on the target branch with a clean tree, folder workspaces, no host-side changes, strict
+host-key SSH with the key the wrapper recorded in `known_hosts`, distinct ports / host keys /
+client keys for two environments, the one-agent lock (second launch exits 75, shells still work,
+lock recovers after a crash), suspend / resume keeping state, `env ls`, `--gc --all` leaving
+environments alone, and destroy removing the container, key and only its own `known_hosts` line.
+
 Layout:
 
 ```
-bin/orca-docker            the wrapper (bash): session lifecycle, seeding, publish handling
-image/Dockerfile           desktop base image
-image/entrypoint.sh        root phase: create host-matching user, drop privileges
+bin/orca-docker            the wrapper (bash): session + environment lifecycle, seeding, publish handling
+orca.yaml                  example Orca environment recipe (copy into your repo)
+scripts/orca-vm/           recipe shim the orca.yaml points at (finds orca-docker, runs `env <mode>`)
+image/Dockerfile           desktop base image (+ openssh-server, no baked host keys)
+image/entrypoint.sh        root phase: create host-matching user, start sshd in environment mode, drop privileges
 image/supervisor.sh        PID-1 child: desktop (Xvfb/XFCE/noVNC), then idles
-image/run-agent.sh         per launch (docker exec): deps, MCP attach, agent, publish on exit
-image/bootstrap-repo.sh    clone the seeded bundle, create orca/<tab>, replay uncommitted changes
-image/orca-docker-cli.sh   in-container `orca-docker publish|status`
+image/profile.sh           lets ssh logins (Orca terminals/agents) inherit the desktop session env
+image/run-agent.sh         per launch (docker exec / ssh): deps, MCP attach, agent, publish on exit
+image/bootstrap-repo.sh    clone the seeded bundle at the pinned commit, create the branch, replay uncommitted changes
+image/orca-docker-cli.sh   in-container `orca-docker claude|publish|status` (agent gate lives here)
 image/outbox-wait.sh       announces publish requests to the host wrapper
 image/mcp/computer-use/    MCP server (node, xdotool/scrot/wmctrl) + publish tool
 examples/repo-dockerfile/  per-repo image example
@@ -255,4 +392,5 @@ test/                      smoke test + fixtures
 - Dependency learning loop: detect apt/npm installs the agent performs and propose them as a
   `docker/Dockerfile` change (never mutate the shared image silently).
 - More agents (`orca-docker codex`, …) once the Claude path is solid.
-- Native Orca runtime instead of a wrapper, if upstream grows per-tab environment recipes.
+- Upstream Orca setting for "max agents per worktree" so the *+ agent* button reflects the
+  one-agent limit instead of the launcher refusing.

@@ -5,6 +5,12 @@
 #
 #   orca-docker publish [--commit MESSAGE] [--auto]   publish the current branch's new commits
 #   orca-docker status                                 show base, branch, published state
+#   orca-docker claude [args...]                       launch an agent here (Orca's command override,
+#                                                      used when this container is a workspace environment)
+#
+# In a per-workspace environment (`orca-docker env`, sshd on) the container is Orca's execution
+# host for one worktree, and one worktree runs one agent: launching a second agent while one is
+# alive is refused (create another workspace instead). Plain terminals are never limited.
 set -uo pipefail
 
 log() { printf '[orca-docker] %s\n' "$*" >&2; }
@@ -91,5 +97,28 @@ case "$cmd" in
       "$(git rev-list --count "$(cat .git/orca-docker/published 2>/dev/null || cat .git/orca-docker/base 2>/dev/null || echo HEAD)..HEAD" 2>/dev/null || echo '?')"
     ;;
   ""|-h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown command: $cmd" ;;
+  -*) die "unknown option: $cmd" ;;
+  *)
+    command -v "$cmd" >/dev/null 2>&1 || die "unknown command: $cmd (not a subcommand, and no such agent binary)"
+    lock=/run/orca-docker/agent.lock
+    mkdir -p /run/orca-docker 2>/dev/null
+    # The lock is the open descriptor: held for as long as the agent process tree lives, released
+    # by the kernel on any kind of exit, so it can never go stale.
+    exec 9>>"$lock"
+    if ! flock -n 9; then
+      holder="$(tr '\n' ' ' < "$lock")"
+      log "refusing to start $cmd: this workspace already has a running agent${holder:+ [$holder]}"
+      log "an orca-docker environment is one container per workspace and one agent per container."
+      log "Create another workspace (same recipe) for a second agent; terminal tabs here are fine."
+      exit 75
+    fi
+    truncate -s 0 "$lock"
+    printf 'agent=%s pid=%s tab=%s since=%s' "$cmd" "$$" "${ORCA_TAB_ID:-none}" "$(date -u +%FT%TZ)" >&9
+    export ORCA_DOCKER_PUBLISH=off
+    if [ -z "${ORCA_DOCKER_REPO:-}" ]; then
+      ORCA_DOCKER_REPO="$(repo_root)" || ORCA_DOCKER_REPO="$PWD"
+      export ORCA_DOCKER_REPO
+    fi
+    exec /opt/orca-docker/run-agent.sh "$cmd" "$@"
+    ;;
 esac
