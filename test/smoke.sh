@@ -55,6 +55,10 @@ mkdir -p "$FAKE_HOME/.agents/skills/ext" "$FAKE_HOME/.claude/skills"
 echo 'ext skill' > "$FAKE_HOME/.agents/skills/ext/SKILL.md"
 ln -s ../../.agents/skills/ext "$FAKE_HOME/.claude/skills/ext"
 ln -s ../../nowhere "$FAKE_HOME/.claude/skills/dangling"
+# hooks referenced from settings.json must come along; per-session state must not
+mkdir -p "$FAKE_HOME/.claude/hooks" "$FAKE_HOME/.claude/projects/-tmp-x"
+echo 'console.log("hook")' > "$FAKE_HOME/.claude/hooks/on-stop.js"
+echo '{}' > "$FAKE_HOME/.claude/projects/-tmp-x/transcript.jsonl"
 printf '[user]\n\tname = smoke\n\temail = smoke@localhost\n' > "$FAKE_HOME/.gitconfig"
 
 HOOK_PORT="$(node -e 'const s=require("net").createServer().listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
@@ -112,6 +116,8 @@ check test -f "\$HOME/.claude.json"
 check test -f "\$HOME/.claude/.credentials.json"
 check test "\$(cat \$HOME/.claude/skills/ext/SKILL.md)" = 'ext skill'
 check test ! -L "\$HOME/.claude/skills/ext"
+check test -f "\$HOME/.claude/hooks/on-stop.js"
+check test ! -e "\$HOME/.claude/projects/-tmp-x"
 check test "\$(git config user.email)" = smoke@localhost
 check claude --version
 check xdpyinfo

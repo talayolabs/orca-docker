@@ -99,9 +99,10 @@ inside it all survive. A container is deleted only by `orca-docker --rm-session`
 `--fresh`.
 
 **Config copied, not mounted.** At first launch the wrapper copies into the container's `$HOME`:
-`~/.claude.json`, `~/.claude/{settings.json,settings.local.json,.credentials.json,CLAUDE.md,commands,agents,skills}`
-(or `$CLAUDE_CONFIG_DIR`), `~/.gitconfig`, `~/.config/git`, and anything listed in
-`ORCA_DOCKER_SEED`. On every launch it refreshes Orca's managed hook script directory
+`~/.claude.json`, `~/.claude` (or `$CLAUDE_CONFIG_DIR`) minus per-session state
+(`projects`, `todos`, caches, …) — so settings, credentials, hooks, skills, commands, agents
+and plugins come along — plus `~/.gitconfig`, `~/.config/git`, and anything listed in
+`ORCA_DOCKER_SEED`. Symlinks are followed (copied as files). On every launch it refreshes Orca's managed hook script directory
 (`~/.orca/agent-hooks`) and hook endpoint file, and `.credentials.json` / `settings.json` when
 the host copy is newer. Nothing in the container can write back to the host except through
 `publish`.
