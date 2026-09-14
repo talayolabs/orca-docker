@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "computer": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/opt/orca-docker/mcp/computer-use/server.mjs"]
+    }
+  }
+}

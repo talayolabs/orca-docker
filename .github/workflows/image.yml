@@ -1,0 +1,43 @@
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths: ['image/**', '.github/workflows/image.yml']
+  schedule:
+    - cron: '0 6 * * 1' # weekly: pick up Debian/Chromium security updates
+  workflow_dispatch:
+    inputs:
+      claude_code_version:
+        description: '@anthropic-ai/claude-code version to bake in'
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: image
+          push: true
+          build-args: |
+            ${{ inputs.claude_code_version && format('CLAUDE_CODE_VERSION={0}', inputs.claude_code_version) || '' }}
+          tags: |
+            ghcr.io/talayolabs/orca-docker:latest
+            ghcr.io/talayolabs/orca-docker:${{ steps.meta.outputs.date }}
+            ghcr.io/talayolabs/orca-docker:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

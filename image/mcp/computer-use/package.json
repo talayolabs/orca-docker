@@ -1,0 +1,12 @@
+{
+  "name": "orca-docker-computer-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal computer-use MCP server for the orca-docker desktop (X11 via xdotool/scrot/wmctrl)",
+  "bin": { "orca-docker-computer-use": "server.mjs" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.0"
+  }
+}
