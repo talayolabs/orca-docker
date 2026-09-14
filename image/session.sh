@@ -42,7 +42,13 @@ start_desktop() {
     eval "$(dbus-launch --sh-syntax)" >/dev/null 2>&1 || true
     export DBUS_SESSION_BUS_ADDRESS
   fi
-  startxfce4 >"$state_dir/xfce.log" 2>&1 &
+  # XFCE components are started directly instead of via startxfce4/xfce4-session: the session
+  # manager's ICE listener lives in the abstract socket namespace, which host networking shares
+  # across containers, so two sessions whose xfce4-session got the same PID collide.
+  xfsettingsd --sm-client-disable >"$state_dir/xfce.log" 2>&1 &
+  xfwm4 --sm-client-disable >>"$state_dir/xfce.log" 2>&1 &
+  xfdesktop --sm-client-disable >>"$state_dir/xfce.log" 2>&1 &
+  xfce4-panel --sm-client-disable >>"$state_dir/xfce.log" 2>&1 &
 
   x11vnc -display "$display" -rfbport "$vnc_port" -listen "$bind" -forever -shared -nopw \
     -noxdamage -xkb -quiet -bg -o "$state_dir/x11vnc.log" >/dev/null 2>&1 || \

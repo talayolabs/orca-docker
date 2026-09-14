@@ -16,7 +16,7 @@ FAILED=0
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/orca-docker-smoke.XXXXXX")"
 cleanup() {
   [ -n "${HOOK_PID:-}" ] && kill "$HOOK_PID" 2>/dev/null || true
-  docker rm -f "orca-docker-smoke-${RUN_ID}" >/dev/null 2>&1 || true
+  docker rm -f "orca-docker-smoke-${RUN_ID}" "orca-docker-smoke-${RUN_ID}-a" "orca-docker-smoke-${RUN_ID}-b" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -116,6 +116,24 @@ else
 fi
 [ -f "$WORKTREE/node_modules/.orca-docker-lockhash" ] && pass "node_modules installed into worktree (host-visible)"
 [ -d "$FAKE_HOME/.claude" ] && [ -f "$FAKE_HOME/.claude.json" ] && pass "claude state dirs created on host"
+
+echo "== concurrent tabs"
+# Two sessions started the same way get the same in-container PIDs; with host networking they
+# share the abstract socket namespace, so anything listening there by PID collides.
+set +e
+TAB_PIDS=""
+for t in a b; do
+  (cd "$WORKTREE" && HOME="$FAKE_HOME" ORCA_TAB_ID="smoke-${RUN_ID}-$t" ORCA_DOCKER_AUTO_INSTALL=0 \
+    timeout 120 "$WRAPPER" bash -c 'for _ in $(seq 1 100); do wmctrl -l 2>/dev/null | grep -q xfce4-panel && exit 0; sleep 0.2; done; exit 1' \
+    </dev/null >"$TMP/tab-$t.log" 2>&1; echo $? >"$TMP/tab-$t.code") &
+  TAB_PIDS="$TAB_PIDS $!"
+done
+# shellcheck disable=SC2086
+wait $TAB_PIDS
+set -e
+for t in a b; do
+  [ "$(cat "$TMP/tab-$t.code")" = 0 ] && pass "concurrent tab $t has a desktop" || fail "concurrent tab $t: no window manager ($(tail -3 "$TMP/tab-$t.log" | tr '\n' ' '))"
+done
 
 echo "== exit status + args pass-through"
 set +e
