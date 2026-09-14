@@ -216,5 +216,29 @@ server.registerTool(
   }
 )
 
+server.registerTool(
+  'publish',
+  {
+    description:
+      'Publish the current branch of the repository to the host: its new commits are fetched into the host repository and pushed to origin (a pull request may be created depending on configuration). Nothing else leaves this container. Optionally commit all uncommitted changes first with the given message.',
+    inputSchema: { commit_message: z.string().min(1).optional() }
+  },
+  async ({ commit_message }) => {
+    const args = ['publish']
+    if (commit_message) args.push('--commit', commit_message)
+    try {
+      const { stdout, stderr } = await execFileAsync('orca-docker', args, {
+        cwd: process.env.ORCA_DOCKER_REPO || process.cwd(),
+        env: process.env,
+        timeout: 180_000
+      })
+      return text((stderr + stdout).trim() || 'published')
+    } catch (err) {
+      const out = `${err.stderr ?? ''}${err.stdout ?? ''}`.trim()
+      return { isError: true, content: [{ type: 'text', text: out || String(err) }] }
+    }
+  }
+)
+
 const transport = new StdioServerTransport()
 await server.connect(transport)

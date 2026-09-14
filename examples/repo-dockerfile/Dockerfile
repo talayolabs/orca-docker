@@ -2,7 +2,7 @@
 # automatically (cached by content hash) whenever it launches an agent in that repo.
 #
 # Keep it thin: apt/system packages and global tools go here; node_modules are installed
-# from the repo lockfile at container start (see image/session.sh), never baked in.
+# from the repo lockfile at container start (see image/run-agent.sh), never baked in.
 FROM ghcr.io/talayolabs/orca-docker:latest
 
 USER root

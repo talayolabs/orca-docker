@@ -39,7 +39,14 @@ assert(init.serverInfo?.name === 'orca-docker-computer', 'serverInfo')
 proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
 
 const tools = (await call('tools/list', {})).tools.map((t) => t.name)
-for (const t of ['screenshot', 'click', 'type', 'key', 'list_windows', 'open']) assert(tools.includes(t), `tool ${t}`)
+for (const t of ['screenshot', 'click', 'type', 'key', 'list_windows', 'open', 'publish']) assert(tools.includes(t), `tool ${t}`)
+
+if (process.argv[2] === '--publish') {
+  // Exercises the publish tool end to end (needs the host wrapper attached to answer).
+  const pub = await call('tools/call', { name: 'publish', arguments: { commit_message: 'mcp publish smoke' } })
+  const txt = pub.content[0].text
+  assert(!pub.isError && txt.includes('published'), `publish tool: ${txt}`)
+}
 
 const shot = await call('tools/call', { name: 'screenshot', arguments: {} })
 const img = shot.content.find((c) => c.type === 'image')

@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# orca-docker — run a coding agent inside a fresh, disposable Linux desktop container.
+# orca-docker — run a coding agent inside its own isolated Linux desktop container.
 #
 # Designed to be Orca's per-agent command override (Settings → Agents → Claude → command):
 #     orca-docker claude
 # Orca appends its own arguments (--model, --prefill, --resume <id>, ...); everything after
-# the agent name is forwarded verbatim, so one container == one Orca agent tab.
+# the agent name is forwarded verbatim. One Orca agent tab == one container, kept between
+# launches: relaunching the tab (e.g. --resume) restarts the same container.
 #
-# Standalone use works too:
+# Nothing from the host is mounted. On first launch the container receives a clone of the
+# repository at the same absolute path (checked out on a new branch, default orca/<tab>),
+# plus copies of the agent login/config and Orca's hook script. Work leaves the container
+# only when the agent (or you) runs `orca-docker publish` inside it — or automatically when
+# the agent exits with unpublished commits: the branch is fetched into the host repository,
+# pushed to origin when there is one, and the resulting branch/PR URL is printed in the pane.
+#
+# Standalone use:
 #     cd ~/my-project && orca-docker claude
-#     orca-docker --shell                 # interactive bash in a fresh container
-#     orca-docker --build                 # build the default image from this checkout
-#     orca-docker --gc                    # remove leftover orca-docker containers
+#     orca-docker --shell                     # interactive bash in this directory's session container
+#     orca-docker --sessions                  # list session containers
+#     orca-docker --rm-session <tab|name>     # remove a session container (the only way it is deleted)
+#     orca-docker --gc [--all]                # remove stopped sessions older than ORCA_DOCKER_GC_DAYS (14)
+#     orca-docker --build                     # build the default image from this checkout
+#     orca-docker --fresh claude              # discard this tab's container and start over
 #
 # Configuration (environment variables, all optional):
 #   ORCA_DOCKER_IMAGE           explicit image to use (highest priority)
@@ -18,19 +29,23 @@
 #                               (default: <worktree>/docker/Dockerfile, then <worktree>/.orca-docker/Dockerfile)
 #   ORCA_DOCKER_DEFAULT_IMAGE   fallback image (default: ghcr.io/talayolabs/orca-docker:latest)
 #   ORCA_DOCKER_NETWORK         host (default on Linux) | bridge
-#   ORCA_DOCKER_MOUNTS          extra bind mounts, space separated, docker -v syntax (src:dst[:opts])
-#   ORCA_DOCKER_ARGS            extra raw `docker run` arguments (word split)
-#   ORCA_DOCKER_ORCA_CLI=1      bridge the host `orca` CLI into the container (mounts Orca userData; opt-in)
-#   ORCA_DOCKER_MOUNT_SSH=1     mount ~/.ssh read-only (git over ssh; opt-in)
-#   ORCA_DOCKER_KEEP=1          keep the container after exit (debugging)
+#   ORCA_DOCKER_BRANCH          in-container working branch (default: orca/<tab>)
+#   ORCA_DOCKER_PUBLISH         local | push (default when origin exists) | pr | off
+#                               local: fetch into the host repo; push: + push to origin; pr: + open a PR with gh
+#   ORCA_DOCKER_CARRY_CHANGES=0 do not carry the host's uncommitted changes into the clone
+#   ORCA_DOCKER_AUTOCOMMIT=1    on exit, commit uncommitted changes in the container before auto-publishing
+#   ORCA_DOCKER_SEED            extra host paths to copy into the container on creation (space separated)
+#   ORCA_DOCKER_ARGS            extra raw `docker create` arguments (word split)
+#   ORCA_DOCKER_KEEP_RUNNING=1  leave the container running after the agent exits (default: stop it)
 #   ORCA_DOCKER_DESKTOP=0 / ORCA_DOCKER_AUTO_INSTALL=0 / ORCA_DOCKER_MCP=0 / ORCA_DOCKER_DISPLAY_SIZE / ORCA_DOCKER_INIT
-#                               forwarded to the container (see image/session.sh)
+#                               forwarded to the container (see image/supervisor.sh, image/run-agent.sh)
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 DEFAULT_IMAGE="${ORCA_DOCKER_DEFAULT_IMAGE:-ghcr.io/talayolabs/orca-docker:latest}"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_IMAGE_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)/image"
+LABEL=orca-docker=1
 
 log()  { printf '[orca-docker] %s\n' "$*" >&2; }
 die()  { log "error: $*"; exit 1; }
@@ -39,11 +54,17 @@ usage() {
   sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
+slugify() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed -e 's/^-*//' -e 's/-*$//' | cut -c1-48; }
+container_name() { echo "orca-docker-$(slugify "$1")"; }
+
 # ---------------------------------------------------------------------------
 # Mode dispatch
 # ---------------------------------------------------------------------------
 MODE=run
+FRESH="${ORCA_DOCKER_FRESH:-0}"
 BUILD_ARGS=()
+GC_ALL=0
+RM_TARGET=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -51,6 +72,10 @@ while [ $# -gt 0 ]; do
     --build) MODE=build; shift ;;
     --no-cache|--pull) BUILD_ARGS+=("$1"); shift ;;
     --gc) MODE=gc; shift ;;
+    --all) GC_ALL=1; shift ;;
+    --sessions|--ls) MODE=sessions; shift ;;
+    --rm-session) MODE="rm"; RM_TARGET="${2:-${ORCA_TAB_ID:-}}"; shift; [ $# -gt 0 ] && shift ;;
+    --fresh) FRESH=1; shift ;;
     --shell) MODE=run; set -- bash "${@:2}"; break ;;
     --print-config) MODE=print; shift ;;
     --) shift; break ;;
@@ -61,22 +86,44 @@ done
 
 command -v docker >/dev/null 2>&1 || die "docker CLI not found in PATH"
 
-if [ "$MODE" = build ]; then
-  [ -f "$REPO_IMAGE_DIR/Dockerfile" ] || die "no image/Dockerfile next to this script ($REPO_IMAGE_DIR); use the published image instead"
-  log "building $DEFAULT_IMAGE from $REPO_IMAGE_DIR"
-  exec docker build "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" -t "$DEFAULT_IMAGE" "$REPO_IMAGE_DIR"
-fi
-
-if [ "$MODE" = gc ]; then
-  stale="$(docker ps -aq --filter label=orca-docker=1 --filter status=exited --filter status=created --filter status=dead)"
-  if [ -n "$stale" ]; then
-    # shellcheck disable=SC2086
-    docker rm -f $stale >/dev/null && log "removed $(echo "$stale" | wc -l) stale container(s)"
-  else
-    log "nothing to clean"
-  fi
-  exit 0
-fi
+case "$MODE" in
+  build)
+    [ -f "$REPO_IMAGE_DIR/Dockerfile" ] || die "no image/Dockerfile next to this script ($REPO_IMAGE_DIR); use the published image instead"
+    log "building $DEFAULT_IMAGE from $REPO_IMAGE_DIR"
+    exec docker build "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" -t "$DEFAULT_IMAGE" "$REPO_IMAGE_DIR"
+    ;;
+  sessions)
+    docker ps -a --filter "label=$LABEL" \
+      --format 'table {{.Names}}\t{{.Status}}\t{{.Label "orca-docker.branch"}}\t{{.Label "orca-docker.worktree"}}'
+    exit 0
+    ;;
+  rm)
+    [ -n "$RM_TARGET" ] || die "--rm-session needs a tab id or container name (or ORCA_TAB_ID in the environment)"
+    for cand in "$RM_TARGET" "$(container_name "$RM_TARGET")"; do
+      if docker container inspect "$cand" >/dev/null 2>&1; then
+        docker rm -f "$cand" >/dev/null && log "removed session $cand"
+        exit 0
+      fi
+    done
+    die "no session container for '$RM_TARGET'"
+    ;;
+  gc)
+    days="${ORCA_DOCKER_GC_DAYS:-14}"
+    now="$(date +%s)"
+    removed=0
+    while IFS=' ' read -r id name finished; do
+      [ -n "$id" ] || continue
+      if [ "$GC_ALL" != 1 ]; then
+        fin="$(date -d "$finished" +%s 2>/dev/null || echo "$now")"
+        [ $(( now - fin )) -ge $(( days * 86400 )) ] || continue
+      fi
+      docker rm -f "$id" >/dev/null && { log "removed $name"; removed=$((removed + 1)); }
+    done < <(docker ps -a --filter "label=$LABEL" --filter status=exited --filter status=created --filter status=dead -q |
+             xargs -r docker inspect --format '{{.Id}} {{.Name}} {{.State.FinishedAt}}')
+    [ "$removed" -gt 0 ] || log "nothing to clean (stopped sessions are kept ${days} days; use --gc --all to remove them now)"
+    exit 0
+    ;;
+esac
 
 [ $# -gt 0 ] || { usage; die "missing agent command (e.g. orca-docker claude)"; }
 
@@ -85,13 +132,12 @@ fi
 # ---------------------------------------------------------------------------
 WORKTREE="$(pwd -P)"
 [ -d "$WORKTREE" ] || die "cwd does not exist: $WORKTREE"
-case "$WORKTREE" in /) die "refusing to mount / as the worktree" ;; esac
+case "$WORKTREE" in /) die "refusing to use / as the worktree" ;; esac
 
 HOST_UID="$(id -u)"; HOST_GID="$(id -g)"; HOST_USER="$(id -un)"
 HOST_HOME="${HOME:?HOME must be set}"
 [ "$HOST_UID" != 0 ] || log "warning: running as root; Claude refuses --dangerously-skip-permissions as root"
 
-slugify() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed -e 's/^-*//' -e 's/-*$//' | cut -c1-48; }
 hash_mod() {  # hash_mod <string> <modulus>
   local h
   h="$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
@@ -102,10 +148,12 @@ TAB_ID="${ORCA_TAB_ID:-}"
 if [ -n "$TAB_ID" ]; then
   SESSION_KEY="$TAB_ID"
 else
-  SESSION_KEY="$(date +%s)-$$"
+  # Standalone: one session per directory, so `orca-docker claude` in the same repo resumes.
+  SESSION_KEY="local-$(basename "$WORKTREE")-$(hash_mod "$WORKTREE" 100000)"
 fi
 SLUG="$(slugify "$SESSION_KEY")"
-CONTAINER="orca-docker-${SLUG}"
+CONTAINER="$(container_name "$SESSION_KEY")"
+BRANCH="${ORCA_DOCKER_BRANCH:-orca/${SLUG}}"
 
 # ---------------------------------------------------------------------------
 # Networking + ports. With --network host every container shares the host's
@@ -133,18 +181,20 @@ display_free() {  # X11 unix sockets live in a shared abstract namespace under -
   fi
 }
 
-SLOT="$(hash_mod "$SESSION_KEY" 900)"
-for _ in $(seq 1 60); do
-  DISPLAY_NUM=$((100 + SLOT))
-  VNC_PORT=$((25000 + SLOT))
-  NOVNC_PORT=$((26000 + SLOT))
-  if [ "$NETWORK" != host ]; then
-    port_free "$NOVNC_PORT" && break
-  elif port_free "$VNC_PORT" && port_free "$NOVNC_PORT" && display_free "$DISPLAY_NUM"; then
-    break
-  fi
-  SLOT=$(( (SLOT + 1) % 900 ))
-done
+allocate_slots() {
+  SLOT="$(hash_mod "$SESSION_KEY" 900)"
+  for _ in $(seq 1 60); do
+    DISPLAY_NUM=$((100 + SLOT))
+    VNC_PORT=$((25000 + SLOT))
+    NOVNC_PORT=$((26000 + SLOT))
+    if [ "$NETWORK" != host ]; then
+      port_free "$NOVNC_PORT" && break
+    elif port_free "$VNC_PORT" && port_free "$NOVNC_PORT" && display_free "$DISPLAY_NUM"; then
+      break
+    fi
+    SLOT=$(( (SLOT + 1) % 900 ))
+  done
+}
 
 # ---------------------------------------------------------------------------
 # Image resolution: explicit > per-repo Dockerfile > default
@@ -177,140 +227,363 @@ resolve_image() {
   echo "$DEFAULT_IMAGE"
 }
 
-IMAGE="$(resolve_image)"
-if ! image_exists "$IMAGE"; then
-  if [ "$IMAGE" = "$DEFAULT_IMAGE" ] && ! docker pull "$IMAGE" >&2; then
-    if [ -f "$REPO_IMAGE_DIR/Dockerfile" ]; then
-      log "pull failed; building $IMAGE locally from $REPO_IMAGE_DIR"
-      docker build -t "$IMAGE" "$REPO_IMAGE_DIR" >&2 || die "image build failed"
-    else
-      die "image $IMAGE is not available"
+ensure_image() {
+  IMAGE="$(resolve_image)"
+  if ! image_exists "$IMAGE"; then
+    if [ "$IMAGE" = "$DEFAULT_IMAGE" ] && ! docker pull "$IMAGE" >&2; then
+      if [ -f "$REPO_IMAGE_DIR/Dockerfile" ]; then
+        log "pull failed; building $IMAGE locally from $REPO_IMAGE_DIR"
+        docker build -t "$IMAGE" "$REPO_IMAGE_DIR" >&2 || die "image build failed"
+      else
+        die "image $IMAGE is not available"
+      fi
+    elif [ "$IMAGE" != "$DEFAULT_IMAGE" ]; then
+      docker pull "$IMAGE" >&2 || die "image $IMAGE is not available"
     fi
-  elif [ "$IMAGE" != "$DEFAULT_IMAGE" ]; then
-    docker pull "$IMAGE" >&2 || die "image $IMAGE is not available"
   fi
-fi
+}
 
 # ---------------------------------------------------------------------------
-# docker run assembly
+# Host repository facts (what gets cloned, and what publish is measured against)
 # ---------------------------------------------------------------------------
-HOSTNAME_SLUG="$(printf '%s' "$SLUG" | tr -c 'A-Za-z0-9-' '-' | cut -c1-20 | sed 's/-*$//')"
-RUN=(docker run --name "$CONTAINER" --hostname "orca-${HOSTNAME_SLUG}"
-  --label orca-docker=1
-  --label "orca-docker.session=${SESSION_KEY}"
-  --label "orca-docker.worktree=${WORKTREE}"
-  --label "orca-docker.agent=$(basename -- "$1")"
-  --shm-size=1g
-  -w "$WORKTREE"
-  -e ORCA_DOCKER_UID="$HOST_UID" -e ORCA_DOCKER_GID="$HOST_GID"
-  -e ORCA_DOCKER_USER="$HOST_USER" -e ORCA_DOCKER_HOME="$HOST_HOME"
-  -e DISPLAY=":${DISPLAY_NUM}"
-  -e ORCA_DOCKER_VNC_PORT="$VNC_PORT" -e ORCA_DOCKER_NOVNC_PORT="$NOVNC_PORT"
-)
-[ -n "${ORCA_WORKTREE_ID:-}" ] && RUN+=(--label "orca-docker.worktree-id=${ORCA_WORKTREE_ID}")
-[ "${ORCA_DOCKER_KEEP:-0}" = 1 ] || RUN+=(--rm)
-if [ -t 0 ] && [ -t 1 ]; then RUN+=(-it); else RUN+=(-i); fi
-
-if [ "$NETWORK" = host ]; then
-  RUN+=(--network host -e ORCA_DOCKER_BIND=127.0.0.1)
-else
-  RUN+=(--network "$NETWORK" -e ORCA_DOCKER_BIND=0.0.0.0
-        -p "127.0.0.1:${NOVNC_PORT}:${NOVNC_PORT}"
-        --add-host host.docker.internal:host-gateway)
-  if [ -n "${ORCA_AGENT_HOOK_PORT:-}" ]; then
-    log "warning: network=$NETWORK — Orca's hook endpoint (127.0.0.1:${ORCA_AGENT_HOOK_PORT}) is not reachable from the container; agent status in Orca will not update"
-  fi
+IS_GIT=0 BASE="" BASE_BRANCH="" ORIGIN=""
+if command -v git >/dev/null 2>&1 && git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1 \
+   && BASE="$(git -C "$WORKTREE" rev-parse --verify -q HEAD)"; then
+  IS_GIT=1
+  BASE_BRANCH="$(git -C "$WORKTREE" symbolic-ref -q --short HEAD || true)"
+  ORIGIN="$(git -C "$WORKTREE" remote get-url origin 2>/dev/null || true)"
 fi
 
-# Environment pass-through. `-e NAME` copies the value from this process, so no quoting issues.
+PUBLISH="${ORCA_DOCKER_PUBLISH:-}"
+if [ -z "$PUBLISH" ]; then
+  if [ -n "$ORIGIN" ]; then PUBLISH=push; else PUBLISH=local; fi
+fi
+case "$PUBLISH" in local|push|pr|off) ;; *) die "ORCA_DOCKER_PUBLISH must be local, push, pr or off" ;; esac
+
+# ---------------------------------------------------------------------------
+# docker create assembly (the container's main process is the desktop supervisor)
+# ---------------------------------------------------------------------------
+build_create_cmd() {
+  local hostname_slug
+  hostname_slug="$(printf '%s' "$SLUG" | tr -c 'A-Za-z0-9-' '-' | cut -c1-20 | sed 's/-*$//')"
+  CREATE=(docker create --name "$CONTAINER" --hostname "orca-${hostname_slug}"
+    --label "$LABEL"
+    --label "orca-docker.session=${SESSION_KEY}"
+    --label "orca-docker.worktree=${WORKTREE}"
+    --label "orca-docker.branch=${BRANCH}"
+    --label "orca-docker.base=${BASE}"
+    --label "orca-docker.agent=$(basename -- "$1")"
+    --shm-size=1g
+    -e ORCA_DOCKER_UID="$HOST_UID" -e ORCA_DOCKER_GID="$HOST_GID"
+    -e ORCA_DOCKER_USER="$HOST_USER" -e ORCA_DOCKER_HOME="$HOST_HOME"
+    -e DISPLAY=":${DISPLAY_NUM}"
+    -e ORCA_DOCKER_VNC_PORT="$VNC_PORT" -e ORCA_DOCKER_NOVNC_PORT="$NOVNC_PORT"
+  )
+  [ -n "${ORCA_WORKTREE_ID:-}" ] && CREATE+=(--label "orca-docker.worktree-id=${ORCA_WORKTREE_ID}")
+  for name in ORCA_DOCKER_DESKTOP ORCA_DOCKER_DISPLAY_SIZE; do
+    [ -n "${!name:-}" ] && CREATE+=(-e "$name")
+  done
+  if [ "$NETWORK" = host ]; then
+    CREATE+=(--network host -e ORCA_DOCKER_BIND=127.0.0.1)
+  else
+    CREATE+=(--network "$NETWORK" -e ORCA_DOCKER_BIND=0.0.0.0
+             -p "127.0.0.1:${NOVNC_PORT}:${NOVNC_PORT}"
+             --add-host host.docker.internal:host-gateway)
+  fi
+  if [ -n "${ORCA_DOCKER_ARGS:-}" ]; then
+    # shellcheck disable=SC2206
+    CREATE+=($ORCA_DOCKER_ARGS)
+  fi
+  CREATE+=("$IMAGE")
+}
+
+# `docker exec` line that runs one agent launch inside the (running) container.
+# `-e NAME` copies the value from this process, so no quoting issues.
 # ORCA_* carries pane/tab identity + hook coordinates; CLAUDE_*/ANTHROPIC_* carry agent config.
-while IFS= read -r name; do
-  case "$name" in
-    ORCA_DOCKER_UID|ORCA_DOCKER_GID|ORCA_DOCKER_USER|ORCA_DOCKER_HOME|ORCA_DOCKER_VNC_PORT|ORCA_DOCKER_NOVNC_PORT|ORCA_DOCKER_BIND) ;;
-    ORCA_DOCKER_IMAGE|ORCA_DOCKER_DOCKERFILE|ORCA_DOCKER_DEFAULT_IMAGE|ORCA_DOCKER_NETWORK|ORCA_DOCKER_MOUNTS|ORCA_DOCKER_ARGS|ORCA_DOCKER_KEEP|ORCA_DOCKER_ORCA_CLI|ORCA_DOCKER_MOUNT_SSH) ;;
-    ORCA_POSIX_SHELL_STARTUP_COMMAND|ORCA_ZDOTDIR|ZDOTDIR) ;;
-    ORCA_*|CLAUDE_*|ANTHROPIC_*|TERM|COLORTERM|LANG|LC_*|TZ|GIT_AUTHOR_*|GIT_COMMITTER_*) RUN+=(-e "$name") ;;
-  esac
-done < <(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | sort -u)
-
-# Bind mounts. Paths are identical inside and out so Claude transcripts, Orca hook
-# payloads (cwd/transcript_path) and resume proofs all line up.
-mount_rw() { if [ -e "$1" ]; then RUN+=(-v "$1:$1"); fi; }
-mount_ro() { if [ -e "$1" ]; then RUN+=(-v "$1:$1:ro"); fi; }
-
-RUN+=(-v "$WORKTREE:$WORKTREE")
-# Git worktrees keep their object store in the main repo's .git; mount it too.
-if command -v git >/dev/null 2>&1; then
-  common_dir="$(git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-  if [ -n "$common_dir" ] && [ -d "$common_dir" ]; then
-    case "$common_dir" in
-      "$WORKTREE"|"$WORKTREE"/*) ;;                 # already inside the worktree mount
-      *) mount_rw "$common_dir" ;;
+build_exec_cmd() {
+  EXEC=(docker exec -u "$HOST_USER" -w "$WORKTREE"
+    -e HOME="$HOST_HOME" -e USER="$HOST_USER" -e LOGNAME="$HOST_USER"
+    -e ORCA_DOCKER_REPO="$WORKTREE" -e ORCA_DOCKER_PUBLISH="$PUBLISH")
+  if [ -t 0 ] && [ -t 1 ]; then EXEC+=(-it); else EXEC+=(-i); fi
+  while IFS= read -r name; do
+    case "$name" in
+      ORCA_DOCKER_UID|ORCA_DOCKER_GID|ORCA_DOCKER_USER|ORCA_DOCKER_HOME|ORCA_DOCKER_VNC_PORT|ORCA_DOCKER_NOVNC_PORT|ORCA_DOCKER_BIND|ORCA_DOCKER_REPO|ORCA_DOCKER_PUBLISH) ;;
+      ORCA_DOCKER_IMAGE|ORCA_DOCKER_DOCKERFILE|ORCA_DOCKER_DEFAULT_IMAGE|ORCA_DOCKER_NETWORK|ORCA_DOCKER_ARGS|ORCA_DOCKER_SEED|ORCA_DOCKER_BRANCH|ORCA_DOCKER_FRESH|ORCA_DOCKER_KEEP_RUNNING|ORCA_DOCKER_CARRY_CHANGES|ORCA_DOCKER_GC_DAYS) ;;
+      ORCA_POSIX_SHELL_STARTUP_COMMAND|ORCA_ZDOTDIR|ZDOTDIR) ;;
+      ORCA_*|CLAUDE_*|ANTHROPIC_*|TERM|COLORTERM|LANG|LC_*|TZ|GIT_AUTHOR_*|GIT_COMMITTER_*) EXEC+=(-e "$name") ;;
     esac
+  done < <(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | sort -u)
+  EXEC+=("$CONTAINER" /opt/orca-docker/run-agent.sh "$@")
+}
+
+# ---------------------------------------------------------------------------
+# Seeding: copies (never mounts) of what the session needs from the host
+# ---------------------------------------------------------------------------
+cexec() { docker exec -u "$HOST_USER" "$CONTAINER" "$@"; }
+dcp() { docker cp -aq "$@" 2>/dev/null || docker cp -a "$@"; }  # -a keeps uid/gid (host uid == container uid)
+
+copy_in() {  # copy_in <host path> [container path]  — file overwrite / directory contents merge
+  local src="$1" dst="${2:-$1}"
+  [ -e "$src" ] || return 0
+  if [ -d "$src" ]; then
+    cexec mkdir -p "$dst" 2>/dev/null || docker exec -u 0 "$CONTAINER" mkdir -p "$dst"
+    dcp "$src/." "$CONTAINER:$dst"
+  else
+    cexec mkdir -p "$(dirname "$dst")" 2>/dev/null || docker exec -u 0 "$CONTAINER" mkdir -p "$(dirname "$dst")"
+    dcp "$src" "$CONTAINER:$dst"
   fi
-fi
+}
+
+copy_in_if_newer() {  # only replace the container's copy when the host file changed more recently
+  local src="$1" host_m cont_m
+  [ -f "$src" ] || return 0
+  host_m="$(stat -c %Y "$src" 2>/dev/null || stat -f %m "$src")"
+  cont_m="$(cexec stat -c %Y "$src" 2>/dev/null || echo 0)"
+  [ "$host_m" -gt "$cont_m" ] && copy_in "$src"
+  return 0
+}
+
+seed_repo() {
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/orca-docker-seed.XXXXXX")"
+  trap 'rm -rf "$tmp"' RETURN
+  if [ "$IS_GIT" = 1 ]; then
+    # Per-session ref name: concurrent tabs of the same worktree bundle at the same time.
+    local refs=(HEAD) dirty_ref="refs/heads/orca-docker-seed-dirty-${SLUG}"
+    [ -n "$BASE_BRANCH" ] && refs+=("refs/heads/$BASE_BRANCH")
+    if [ "${ORCA_DOCKER_CARRY_CHANGES:-1}" != 0 ] && [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null)" ]; then
+      # Snapshot tracked + untracked (non-ignored) changes as a throwaway commit so the clone
+      # starts with the same uncommitted changes; the ref is removed from the host right after.
+      local idx tree commit
+      idx="$tmp/index"
+      GIT_INDEX_FILE="$idx" git -C "$WORKTREE" read-tree HEAD
+      GIT_INDEX_FILE="$idx" git -C "$WORKTREE" add -A . >/dev/null 2>&1 || true
+      tree="$(GIT_INDEX_FILE="$idx" git -C "$WORKTREE" write-tree)"
+      commit="$(GIT_AUTHOR_NAME=orca-docker GIT_AUTHOR_EMAIL=orca-docker@localhost \
+                GIT_COMMITTER_NAME=orca-docker GIT_COMMITTER_EMAIL=orca-docker@localhost \
+                git -C "$WORKTREE" commit-tree "$tree" -p "$BASE" -m "orca-docker seed: host uncommitted changes")"
+      git -C "$WORKTREE" update-ref "$dirty_ref" "$commit"
+      refs+=("$dirty_ref")
+      log "carrying the host's uncommitted changes into the clone (they stay untouched on the host)"
+    fi
+    git -C "$WORKTREE" bundle create -q "$tmp/repo.bundle" "${refs[@]}" || die "could not bundle the repository"
+    git -C "$WORKTREE" update-ref -d "$dirty_ref" 2>/dev/null || true
+  else
+    log "warning: $WORKTREE is not a git repository (or has no commits): copying it as-is; publishing is disabled"
+    tar -C "$WORKTREE" --exclude=./node_modules --exclude=./.venv -cf "$tmp/repo.tar" .
+  fi
+  docker exec -u 0 "$CONTAINER" mkdir -p /run/orca-docker/seed
+  dcp "$tmp/." "$CONTAINER:/run/orca-docker/seed"
+  docker exec -u 0 \
+    -e ORCA_DOCKER_UID="$HOST_UID" -e ORCA_DOCKER_GID="$HOST_GID" -e ORCA_DOCKER_HOME="$HOST_HOME" \
+    -e ORCA_DOCKER_REPO="$WORKTREE" -e ORCA_DOCKER_BASE="$BASE" -e ORCA_DOCKER_BASE_BRANCH="$BASE_BRANCH" \
+    -e ORCA_DOCKER_BRANCH="$BRANCH" -e ORCA_DOCKER_ORIGIN="$ORIGIN" -e ORCA_DOCKER_DIRTY_REF="orca-docker-seed-dirty-${SLUG}" \
+    "$CONTAINER" /opt/orca-docker/bootstrap-repo.sh || die "repository bootstrap failed"
+}
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOST_HOME/.claude}"
-mkdir -p "$CLAUDE_DIR"
-mount_rw "$CLAUDE_DIR"
-[ "$CLAUDE_DIR" = "$HOST_HOME/.claude" ] || { mkdir -p "$HOST_HOME/.claude"; mount_rw "$HOST_HOME/.claude"; }
-[ -f "$HOST_HOME/.claude.json" ] || echo '{}' > "$HOST_HOME/.claude.json"
-mount_rw "$HOST_HOME/.claude.json"
-mount_ro "$HOST_HOME/.orca/agent-hooks"
-# rw: the hook script spools events next to the endpoint file when Orca is unreachable.
-if [ -n "${ORCA_AGENT_HOOK_ENDPOINT:-}" ]; then
-  mount_rw "$(dirname "$ORCA_AGENT_HOOK_ENDPOINT")"
-fi
-mount_ro "$HOST_HOME/.gitconfig"
-mount_ro "$HOST_HOME/.config/git"
-[ "${ORCA_DOCKER_MOUNT_SSH:-0}" = 1 ] && mount_ro "$HOST_HOME/.ssh"
+seed_agent_state() {  # first launch only: login, settings, user-level instructions/commands/agents
+  copy_in "$HOST_HOME/.claude.json"
+  for f in settings.json settings.local.json .credentials.json CLAUDE.md commands agents skills; do
+    copy_in "$CLAUDE_DIR/$f"
+  done
+  copy_in "$HOST_HOME/.gitconfig"
+  copy_in "$HOST_HOME/.config/git"
+  if [ -n "${ORCA_DOCKER_SEED:-}" ]; then
+    for p in $ORCA_DOCKER_SEED; do
+      case "$p" in /*) ;; '~'/*) p="$HOST_HOME/${p#'~'/}" ;; *) p="$HOST_HOME/$p" ;; esac
+      copy_in "$p"
+    done
+  fi
+}
 
-# Optional: make the host Orca CLI usable inside (`orca ...`). Requires the runtime
-# metadata + unix socket in Orca's userData dir, and the CLI bundle from the app.
-if [ "${ORCA_DOCKER_ORCA_CLI:-0}" = 1 ]; then
-  user_data="${ORCA_USER_DATA_PATH:-}"
-  if [ -z "$user_data" ] && [ -n "${ORCA_AGENT_HOOK_ENDPOINT:-}" ]; then
-    user_data="$(dirname "$(dirname "$ORCA_AGENT_HOOK_ENDPOINT")")"
-  fi
-  [ -z "$user_data" ] && [ -d "$HOST_HOME/.config/orca" ] && user_data="$HOST_HOME/.config/orca"
-  cli_launcher="$(command -v "${ORCA_CLI_COMMAND:-orca-ide}" 2>/dev/null || command -v orca-ide 2>/dev/null || true)"
-  cli_entry=""
-  if [ -n "$cli_launcher" ] && [ -f "$cli_launcher" ]; then
-    cli_entry="$(sed -n "s/^CLI='\(.*\)'$/\1/p" "$cli_launcher" | head -1)"
-  fi
-  if [ -n "$user_data" ] && [ -d "$user_data" ] && [ -n "$cli_entry" ] && [ -f "$cli_entry" ]; then
-    app_root="${cli_entry%/out/cli/*}"
-    mount_rw "$user_data"
-    mount_ro "$app_root"
-    RUN+=(-e ORCA_USER_DATA_PATH="$user_data" -e ORCA_DOCKER_CLI_ENTRY="$cli_entry")
+seed_launch_state() {  # every launch: Orca rotates hook port/token per app run, login tokens refresh
+  copy_in "$HOST_HOME/.orca/agent-hooks"
+  [ -z "${ORCA_AGENT_HOOK_ENDPOINT:-}" ] || copy_in "$(dirname "$ORCA_AGENT_HOOK_ENDPOINT")"
+  copy_in_if_newer "$CLAUDE_DIR/.credentials.json"
+  copy_in_if_newer "$CLAUDE_DIR/settings.json"   # Orca (re)installs its status hook here
+}
+
+# ---------------------------------------------------------------------------
+# Publish: serve `orca-docker publish` requests coming out of the container
+# ---------------------------------------------------------------------------
+github_web_url() {  # github_web_url <remote url> → https://github.com/owner/repo (empty if not GitHub)
+  case "$1" in
+    git@github.com:*) printf 'https://github.com/%s' "$(printf '%s' "${1#git@github.com:}" | sed 's/\.git$//')" ;;
+    https://github.com/*|http://github.com/*|ssh://git@github.com/*)
+      printf 'https://github.com/%s' "$(printf '%s' "$1" | sed -e 's#^[a-z]*://\(git@\)\{0,1\}github.com/##' -e 's/\.git$//')" ;;
+  esac
+}
+
+handle_publish() {  # handle_publish <seq>
+  local seq="$1" tmp meta bundle result branch base_branch subject commits url="" note="" err=""
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/orca-docker-pub.XXXXXX")"
+  meta="$tmp/meta"; bundle="$tmp/repo.bundle"; result="$tmp/result"
+  dcp "$CONTAINER:/run/orca-docker/outbox/$seq.meta" "$meta"
+  dcp "$CONTAINER:/run/orca-docker/outbox/$seq.bundle" "$bundle"
+  branch="$(sed -n 's/^branch=//p' "$meta")"; base_branch="$(sed -n 's/^base_branch=//p' "$meta")"
+  subject="$(sed -n 's/^subject=//p' "$meta")"; commits="$(sed -n 's/^commits=//p' "$meta")"
+
+  if [ "$IS_GIT" != 1 ]; then
+    err="host directory is not a git repository"
+  elif ! git -C "$WORKTREE" bundle verify "$bundle" >/dev/null 2>&1; then
+    err="bundle does not apply to $WORKTREE (missing base commits?)"
+  elif ! git -C "$WORKTREE" fetch -q "$bundle" "+refs/heads/$branch:refs/heads/$branch" 2>"$tmp/fetch.err"; then
+    err="could not update local branch $branch: $(tr '\n' ' ' <"$tmp/fetch.err")"
   else
-    log "warning: ORCA_DOCKER_ORCA_CLI=1 but could not locate Orca userData/CLI (userData='$user_data', cli='$cli_entry')"
+    url="$WORKTREE (branch $branch)"
+    if [ "$PUBLISH" = push ] || [ "$PUBLISH" = pr ]; then
+      if [ -z "$ORIGIN" ]; then
+        note="no origin remote: branch only exists locally"
+      elif GIT_TERMINAL_PROMPT=0 git -C "$WORKTREE" push -q -u origin "refs/heads/$branch:refs/heads/$branch" 2>"$tmp/push.err"; then
+        url="$ORIGIN $branch"
+        local web; web="$(github_web_url "$ORIGIN")"
+        if [ -n "$web" ]; then
+          url="$web/tree/$branch"
+          if [ "$PUBLISH" = pr ] && command -v gh >/dev/null 2>&1; then
+            local pr_url
+            if pr_url="$(gh pr view "$branch" --repo "${web#https://github.com/}" --json url -q .url 2>/dev/null)"; then
+              url="$pr_url"; note="pull request updated"
+            elif pr_url="$(cd "$WORKTREE" && gh pr create --head "$branch" ${base_branch:+--base "$base_branch"} \
+                             --title "$subject" --body "Published by orca-docker from an isolated session ($commits commit(s))." 2>"$tmp/gh.err")"; then
+              url="$pr_url"; note="pull request created"
+            else
+              note="pushed, but gh pr create failed: $(tail -1 "$tmp/gh.err")"
+              url="$web/compare/${base_branch:+$base_branch...}$branch?expand=1"
+            fi
+          else
+            note="open a pull request: $web/compare/${base_branch:+$base_branch...}$branch?expand=1"
+          fi
+        fi
+      else
+        note="pushed to local repo only; push to origin failed: $(tail -1 "$tmp/push.err")"
+      fi
+    fi
   fi
+
+  if [ -n "$err" ]; then
+    printf 'status=error\nerror=%s\n' "$err" > "$result"
+    log "publish failed: $err"
+  else
+    printf 'status=ok\nurl=%s\n' "$url" > "$result"
+    [ -n "$note" ] && printf 'note=%s\n' "$note" >> "$result"
+    log "published $branch ($commits commit(s)) → $url${note:+  [$note]}"
+    # Recorded on the container so `--sessions` and the next launch can show it.
+    docker exec -u 0 "$CONTAINER" sh -c 'printf "%s\n" "$1" > /run/orca-docker/last-publish' _ "$url" 2>/dev/null || true
+  fi
+  dcp "$result" "$CONTAINER:/run/orca-docker/outbox/$seq.result"
+  rm -rf "$tmp"
+}
+
+publish_watcher() {
+  docker exec "$CONTAINER" /opt/orca-docker/outbox-wait.sh 2>/dev/null | while IFS= read -r meta; do
+    handle_publish "${meta%.meta}"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Session lifecycle
+# ---------------------------------------------------------------------------
+container_state() {
+  local s
+  s="$(docker container inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null)" || s=""
+  echo "${s:-absent}"
+}
+
+wait_ready() {
+  for _ in $(seq 1 300); do
+    if docker exec "$CONTAINER" sh -c '[ -f /run/orca-docker/ready ] && [ /run/orca-docker/ready -nt /proc/1 ]' 2>/dev/null; then
+      return 0
+    fi
+    [ "$(container_state)" = running ] || die "container $CONTAINER stopped during startup: $(docker logs --tail 20 "$CONTAINER" 2>&1 | tail -5)"
+    sleep 0.1
+  done
+  log "warning: container did not report ready in 30s; continuing"
+}
+
+STATE="$(container_state)"
+if [ "$FRESH" = 1 ] && [ "$STATE" != absent ]; then
+  log "--fresh: removing existing session container $CONTAINER"
+  docker rm -f "$CONTAINER" >/dev/null
+  STATE=absent
 fi
 
-if [ -n "${ORCA_DOCKER_MOUNTS:-}" ]; then
-  for spec in $ORCA_DOCKER_MOUNTS; do RUN+=(-v "$spec"); done
+if [ "$STATE" = absent ]; then
+  ensure_image
+  allocate_slots
+  build_create_cmd "$@"
+else
+  IMAGE="$(docker container inspect -f '{{.Config.Image}}' "$CONTAINER")"
+  DISPLAY_NUM="$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" | sed -n 's/^DISPLAY=://p')"
+  NOVNC_PORT="$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" | sed -n 's/^ORCA_DOCKER_NOVNC_PORT=//p')"
+  BRANCH="$(docker container inspect -f '{{index .Config.Labels "orca-docker.branch"}}' "$CONTAINER")"
+  CREATE=()
 fi
-if [ -n "${ORCA_DOCKER_ARGS:-}" ]; then
-  # shellcheck disable=SC2206
-  RUN+=($ORCA_DOCKER_ARGS)
-fi
-
-RUN+=("$IMAGE" "$@")
+build_exec_cmd "$@"
 
 if [ "$MODE" = print ]; then
-  printf '%q ' "${RUN[@]}"; echo
+  if [ "${#CREATE[@]}" -gt 0 ]; then printf '%q ' "${CREATE[@]}"; echo; fi
+  printf '%q ' "${EXEC[@]}"; echo
   exit 0
 fi
 
-# A container with this name means a previous launch in the same tab died uncleanly.
-if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
-  log "removing stale container $CONTAINER"
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+if [ "$STATE" = absent ]; then
+  log "new session $CONTAINER  image $IMAGE  network $NETWORK  branch $BRANCH"
+  "${CREATE[@]}" >/dev/null
+  docker start "$CONTAINER" >/dev/null
+  wait_ready
+  seed_agent_state
+  seed_repo
+else
+  if [ "$STATE" != running ]; then
+    log "resuming session $CONTAINER (branch $BRANCH)"
+    docker start "$CONTAINER" >/dev/null
+  else
+    log "attaching to running session $CONTAINER (branch $BRANCH)"
+  fi
+  wait_ready
 fi
+seed_launch_state
 
-log "container $CONTAINER  image $IMAGE  network $NETWORK"
 if [ "${ORCA_DOCKER_DESKTOP:-1}" != 0 ]; then
   log "desktop: http://127.0.0.1:${NOVNC_PORT}/vnc.html?autoconnect=1&resize=scale"
 fi
-exec "${RUN[@]}"
+
+WATCHER_PID=""
+if [ "$PUBLISH" != off ]; then
+  publish_watcher &
+  WATCHER_PID=$!
+fi
+
+finish() {
+  if [ -n "$WATCHER_PID" ]; then
+    kill "$WATCHER_PID" 2>/dev/null || true
+    wait "$WATCHER_PID" 2>/dev/null || true
+    WATCHER_PID=""
+  fi
+  if [ "${ORCA_DOCKER_KEEP_RUNNING:-0}" != 1 ]; then
+    [ "$(container_state)" != running ] || docker stop -t 5 "$CONTAINER" >/dev/null 2>&1 || true
+  else
+    docker exec "$CONTAINER" pkill -f outbox-wait.sh >/dev/null 2>&1 || true
+  fi
+}
+on_signal() {
+  # The pane is going away (tab closed / Orca quitting): stop the whole session container;
+  # it stays on disk and the next launch of this tab resumes it.
+  trap - INT TERM HUP
+  finish
+  exit 130
+}
+trap on_signal INT TERM HUP
+
+# Run the agent as a background job and wait for it, so signals reach the trap immediately
+# instead of after the agent exits; stdin is passed through explicitly (bash would otherwise
+# give a background command /dev/null).
+exec 3<&0
+"${EXEC[@]}" <&3 &
+AGENT_PID=$!
+code=0
+wait "$AGENT_PID" || code=$?
+finish
+log "session $CONTAINER kept (stopped). Relaunch this tab to resume, or: orca-docker --rm-session ${SESSION_KEY}"
+exit "$code"

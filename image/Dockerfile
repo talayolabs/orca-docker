@@ -7,8 +7,11 @@
 #   - git, Node.js + pnpm/npm/yarn (via corepack), Python, build tools, sudo (passwordless)
 #   - Claude Code CLI (first supported agent)
 #
-# The container user is created at start time with the host's UID/GID/HOME so
-# bind-mounted worktree, ~/.claude and ~/.orca paths are identical inside and out.
+# Nothing from the host is mounted. The wrapper seeds a clone of the repository (same
+# absolute path as the host worktree) plus copies of the agent login/config, and the
+# session's commits leave the container only through `orca-docker publish` (git bundle
+# handed to the host). The container user is created at start time with the host's
+# UID/GID/HOME so paths and commit identity line up.
 # Repos customize by building `FROM` this image (see examples/repo-dockerfile).
 
 ARG BASE_IMAGE=debian:bookworm-slim
@@ -46,10 +49,10 @@ COPY mcp/computer-use /opt/orca-docker/mcp/computer-use
 RUN cd /opt/orca-docker/mcp/computer-use && npm install --omit=dev && npm cache clean --force
 
 COPY mcp.json /opt/orca-docker/mcp.json
-COPY entrypoint.sh /opt/orca-docker/entrypoint.sh
-COPY session.sh /opt/orca-docker/session.sh
+COPY entrypoint.sh supervisor.sh run-agent.sh bootstrap-repo.sh outbox-wait.sh /opt/orca-docker/
+COPY orca-docker-cli.sh /usr/local/bin/orca-docker
 COPY chromium-wrapper.sh /usr/local/bin/chromium-wrapper
-RUN chmod 755 /opt/orca-docker/entrypoint.sh /opt/orca-docker/session.sh /usr/local/bin/chromium-wrapper \
+RUN chmod 755 /opt/orca-docker/*.sh /usr/local/bin/orca-docker /usr/local/bin/chromium-wrapper \
     && ln -sf /usr/local/bin/chromium-wrapper /usr/local/bin/google-chrome \
     && ln -sf /usr/local/bin/chromium-wrapper /usr/local/bin/chrome
 
@@ -66,6 +69,7 @@ LABEL org.opencontainers.image.title="orca-docker desktop" \
       org.opencontainers.image.description="Disposable Linux desktop for one Orca agent session" \
       org.opencontainers.image.source="https://github.com/talayolabs/orca-docker"
 
-# Runs as root only long enough to create the session user, then drops privileges.
+# Runs as root only long enough to create the session user, then drops privileges into the
+# supervisor (desktop + idle). Agents run via `docker exec ... /opt/orca-docker/run-agent.sh`.
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/orca-docker/entrypoint.sh"]
-CMD ["bash"]
+CMD []
