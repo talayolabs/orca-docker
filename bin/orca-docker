@@ -16,7 +16,10 @@
 #
 # Standalone use:
 #     cd ~/my-project && orca-docker claude
-#     orca-docker --shell                     # interactive bash in this directory's session container
+#     orca-docker shell [tab|name]            # terminal inside this worktree's session container
+#                                             (from any Orca terminal tab; picks when there are several)
+#     orca-docker desktop [tab|name]          # open that container's desktop (noVNC) in Orca's browser pane
+#     orca-docker --shell                     # interactive bash as *this* tab's agent (creates the session)
 #     orca-docker --sessions                  # list session containers
 #     orca-docker --rm-session <tab|name>     # remove a session container (the only way it is deleted)
 #     orca-docker --gc [--all]                # remove stopped sessions older than ORCA_DOCKER_GC_DAYS (14)
@@ -69,6 +72,64 @@ usage() {
 slugify() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed -e 's/^-*//' -e 's/-*$//' | cut -c1-48; }
 container_name() { echo "orca-docker-$(slugify "$1")"; }
 
+# session_container [tab|name]: sets SESSION_CONTAINER to a started session container of this
+# worktree (an Orca terminal tab has its own ORCA_TAB_ID, so the agent's container is found by the
+# worktree label, not the tab). One running container wins; otherwise the user picks.
+session_container() {
+  local want="${1:-}" cand rows n i pick
+  SESSION_CONTAINER=""; SESSION_STARTED_HERE=0
+  if [ -n "$want" ]; then
+    for cand in "$want" "$(container_name "$want")"; do
+      docker container inspect "$cand" >/dev/null 2>&1 && { SESSION_CONTAINER="$cand"; break; }
+    done
+    [ -n "$SESSION_CONTAINER" ] || die "no session container for '$want' (orca-docker --sessions)"
+  else
+    rows="$(docker ps -a --filter "label=$LABEL" --filter "label=orca-docker.worktree=$(pwd -P)" \
+      --format '{{.Names}}\t{{.State}}\t{{.Label "orca-docker.kind"}}\t{{.Label "orca-docker.branch"}}\t{{.Status}}' |
+      sort -t "$(printf '\t')" -k2,2r)"  # running first
+    [ -n "$rows" ] || die "no session container for this worktree ($(pwd -P)); start an agent tab first, or pass a tab id / name (orca-docker --sessions)"
+    n="$(printf '%s\n' "$rows" | wc -l)"
+    if [ "$n" = 1 ] || [ "$(printf '%s\n' "$rows" | awk -F'\t' '$2=="running"' | wc -l)" = 1 ]; then
+      SESSION_CONTAINER="$(printf '%s\n' "$rows" | awk -F'\t' 'NR==1{print $1}')"
+    else
+      [ -t 0 ] || die "several session containers for this worktree; pass one:$(printf '\n  %s' "$(printf '%s\n' "$rows" | cut -f1,2,4 | tr '\t' ' ')")"
+      log "several session containers for this worktree:"
+      i=0
+      while IFS=$'\t' read -r name state kind branch status; do
+        i=$((i + 1))
+        printf '  %d) %-52s %-8s %-6s %s  (%s)\n' "$i" "$name" "$state" "${kind:-tab}" "$branch" "$status" >&2
+      done <<< "$rows"
+      read -r -p "[orca-docker] which one? [1-$n] " pick </dev/tty
+      [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "$n" ] || die "no such choice"
+      SESSION_CONTAINER="$(printf '%s\n' "$rows" | awk -F'\t' -v n="$pick" 'NR==n{print $1}')"
+    fi
+  fi
+  if [ "$(docker container inspect -f '{{.State.Status}}' "$SESSION_CONTAINER")" != running ]; then
+    log "starting $SESSION_CONTAINER"
+    docker start "$SESSION_CONTAINER" >/dev/null || die "could not start $SESSION_CONTAINER"
+    SESSION_STARTED_HERE=1
+  fi
+  for _ in $(seq 1 300); do  # the desktop session must be up before a login shell sources its env
+    docker exec "$SESSION_CONTAINER" sh -c '[ -f /run/orca-docker/ready ] && [ /run/orca-docker/ready -nt /proc/1 ]' 2>/dev/null && break
+    [ "$(docker container inspect -f '{{.State.Status}}' "$SESSION_CONTAINER")" = running ] || die "$SESSION_CONTAINER stopped: $(docker logs --tail 5 "$SESSION_CONTAINER" 2>&1)"
+    sleep 0.1
+  done
+}
+
+# open_in_orca_browser <url>: into Orca's per-worktree browser pane via the orca CLI when it is
+# there (Orca puts it on the PATH of its terminals); the printed URL is the fallback either way.
+open_in_orca_browser() {
+  local cli
+  cli="$(command -v orca 2>/dev/null || true)"
+  [ -n "$cli" ] || [ ! -x "${ORCA_REMOTE_CLI_BIN_DIR:-/nonexistent}/orca" ] || cli="$ORCA_REMOTE_CLI_BIN_DIR/orca"
+  [ -n "$cli" ] || { log "orca CLI not on PATH: open the URL above (from an Orca terminal, links open in the worktree browser)"; return 0; }
+  if "$cli" tab create --url "$1" --worktree active >/dev/null 2>&1; then
+    log "desktop opened in Orca's browser pane for this worktree"
+  else
+    log "could not open a browser tab through the orca CLI (not inside an Orca worktree terminal?): open the URL above"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Mode dispatch
 # ---------------------------------------------------------------------------
@@ -78,6 +139,7 @@ FRESH="${ORCA_DOCKER_FRESH:-0}"
 BUILD_ARGS=()
 GC_ALL=0
 RM_TARGET=""
+SESSION_TARGET=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -92,6 +154,10 @@ while [ $# -gt 0 ]; do
     --shell) MODE=run; set -- bash "${@:2}"; break ;;
     --print-config) MODE=print; shift ;;
     env) MODE="env"; ENV_CMD="${2:-}"; shift; [ $# -gt 0 ] && shift; break ;;
+    shell|desktop)  # optional <tab|container>, then (shell) arguments for bash
+      MODE="$1"; shift
+      case "${1:-}" in ""|-*) ;; *) SESSION_TARGET="$1"; shift ;; esac
+      break ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (agent arguments go after the agent name)" ;;
     *) break ;;
@@ -137,6 +203,28 @@ case "$MODE" in
              xargs -r docker inspect --format '{{.Id}} {{.Name}} {{.State.FinishedAt}} {{index .Config.Labels "orca-docker.kind"}}')
     [ "$removed" -gt 0 ] || log "nothing to clean (stopped sessions are kept ${days} days; use --gc --all to remove them now)"
     exit 0
+    ;;
+  shell|desktop)
+    session_container "$SESSION_TARGET"
+    if [ "$MODE" = desktop ]; then
+      port="$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SESSION_CONTAINER" | sed -n 's/^ORCA_DOCKER_NOVNC_PORT=//p')"
+      [ -n "$port" ] || die "$SESSION_CONTAINER has no desktop (ORCA_DOCKER_DESKTOP=0)"
+      url="http://127.0.0.1:${port}/vnc.html?autoconnect=1&resize=scale"
+      echo "$url"
+      [ "${SESSION_STARTED_HERE:-0}" = 0 ] || log "started $SESSION_CONTAINER for its desktop; it stays running (orca-docker --sessions)"
+      open_in_orca_browser "$url"
+      exit 0
+    fi
+    log "shell in $SESSION_CONTAINER ($(docker container inspect -f '{{index .Config.Labels "orca-docker.worktree"}}' "$SESSION_CONTAINER"))"
+    SHELL_CMD=(docker exec -u "$(id -un)" -w "$(docker container inspect -f '{{index .Config.Labels "orca-docker.worktree"}}' "$SESSION_CONTAINER")"
+      -e HOME="$HOME" -e USER="$(id -un)" -e LOGNAME="$(id -un)" -e TERM="${TERM:-xterm-256color}")
+    if [ -t 0 ] && [ -t 1 ]; then SHELL_CMD+=(-it); else SHELL_CMD+=(-i); fi
+    code=0
+    "${SHELL_CMD[@]}" "$SESSION_CONTAINER" bash -l "$@" || code=$?
+    if [ "${SESSION_STARTED_HERE:-0}" = 1 ] && [ "${ORCA_DOCKER_KEEP_RUNNING:-0}" != 1 ]; then
+      docker stop -t 5 "$SESSION_CONTAINER" >/dev/null 2>&1 || true  # we woke it up only for this shell
+    fi
+    exit "$code"
     ;;
 esac
 

@@ -5,6 +5,8 @@
 #
 #   orca-docker publish [--commit MESSAGE] [--auto]   publish the current branch's new commits
 #   orca-docker status                                 show base, branch, published state
+#   orca-docker desktop [--print]                      open this container's desktop (noVNC) in Orca's
+#                                                      browser pane for the worktree; --print only prints the URL
 #   orca-docker claude [args...]                       launch an agent here (Orca's command override,
 #                                                      used when this container is a workspace environment)
 #
@@ -95,6 +97,28 @@ case "$cmd" in
       "$(cat .git/orca-docker/base 2>/dev/null || echo -)" "$(cat .git/orca-docker/base-branch 2>/dev/null || echo -)" \
       "$(cat .git/orca-docker/published 2>/dev/null || echo never)" \
       "$(git rev-list --count "$(cat .git/orca-docker/published 2>/dev/null || cat .git/orca-docker/base 2>/dev/null || echo HEAD)..HEAD" 2>/dev/null || echo '?')"
+    ;;
+  desktop)
+    print_only=0
+    [ "${1:-}" != --print ] || print_only=1
+    # shellcheck source=/dev/null
+    [ ! -f /run/orca-docker/env ] || . /run/orca-docker/env
+    [ -n "${ORCA_DOCKER_NOVNC_PORT:-}" ] || die "no desktop in this container (ORCA_DOCKER_DESKTOP=0?)"
+    # The wrapper publishes noVNC on the same port on the host's loopback, so the URL is valid from
+    # both sides: Orca's browser pane browsing through the SSH host, or directly on the host.
+    url="http://127.0.0.1:${ORCA_DOCKER_NOVNC_PORT}/vnc.html?autoconnect=1&resize=scale"
+    echo "$url"
+    [ "$print_only" = 0 ] || exit 0
+    orca_cli="$(command -v orca 2>/dev/null || true)"
+    for cand in "${ORCA_REMOTE_CLI_BIN_DIR:-}/orca" "$HOME/.orca-relay/bin/orca"; do
+      [ -n "$orca_cli" ] || [ ! -x "$cand" ] || orca_cli="$cand"
+    done
+    [ -n "$orca_cli" ] || { log "orca CLI not found in this container: open the URL above (Orca links open in the worktree browser)"; exit 0; }
+    if "$orca_cli" tab create --url "$url" --worktree active >/dev/null 2>&1; then
+      log "desktop opened in Orca's browser pane for this worktree"
+    else
+      log "could not open a browser tab through the orca CLI: open the URL above"
+    fi
     ;;
   ""|-h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' ;;
   -*) die "unknown option: $cmd" ;;

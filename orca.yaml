@@ -12,3 +12,14 @@ environmentRecipes:
     suspend: ./scripts/orca-vm/orca-docker.sh suspend
     resume: ./scripts/orca-vm/orca-docker.sh resume
     destroy: ./scripts/orca-vm/orca-docker.sh destroy
+
+# Tabs every new worktree opens with. Terminal tabs run on the worktree's execution host, so with
+# "Run on: orca-docker" both are shells *inside* the container; the first one also opens the
+# container's desktop (noVNC) in Orca's browser pane for that worktree. Orca runs default-tab
+# commands only where it also runs setup scripts (repo trust / "run hooks"); otherwise the tabs open
+# without them and you run `orca-docker desktop` yourself.
+defaultTabs:
+  - title: desktop
+    color: "#8b5cf6"
+    command: orca-docker desktop
+  - title: container shell

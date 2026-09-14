@@ -111,6 +111,29 @@ orca-docker env destroy <container>       # remove one by hand (container, clien
 (`ORCA_VM_*` / `ORCA_REPO_*` environment in, exactly one JSON result on stdout, lifecycle
 payload on stdin) and are meant to be called by Orca through the shim.
 
+### Terminal and desktop of the container
+
+- **Terminal:** every *+ terminal* tab of a worktree that runs on `orca-docker` already *is* a
+  shell inside its container — Orca runs terminals on the execution host. Nothing to add.
+- **Desktop:** the container's XFCE desktop is served over noVNC on a host loopback port. From
+  any terminal tab of the worktree run
+
+  ```sh
+  orca-docker desktop           # prints the URL and opens it in Orca's browser pane for this worktree
+  orca-docker desktop --print   # URL only
+  ```
+
+  The command uses Orca's own CLI (`orca tab create --url … --worktree active`, on the PATH of
+  Orca terminals) so the desktop opens as a browser tab **scoped to that worktree**. Without the
+  CLI, or outside Orca, it prints the URL — paste it in any browser on the host. Only the
+  loopback port is published, so nothing is reachable from other machines.
+- **On worktree creation:** `orca.yaml` shows a `defaultTabs` block that opens a *desktop*
+  tab (running `orca-docker desktop`) and a *container shell* tab in every new worktree. Orca
+  runs default-tab commands only when it also runs the repo's setup scripts (trusted repo /
+  "run hooks"); otherwise the tabs still open, without the command.
+
+RDP is not needed: noVNC ships in the image and Orca's browser pane renders it.
+
 ### Limits
 
 - Orca offers recipes for **git repositories only**; folder workspaces use the per-tab
@@ -179,7 +202,9 @@ prompts, …) and the wrapper forwards them verbatim to `claude` inside the cont
 ```sh
 cd ~/some-repo
 orca-docker claude            # agent in its own desktop container (one per directory outside Orca)
-orca-docker --shell           # a bash shell in the same container
+orca-docker shell             # terminal inside this worktree's session container (see below)
+orca-docker desktop           # its desktop (noVNC) in Orca's browser pane / as a URL
+orca-docker --shell           # a bash shell *as this tab's agent* (creates the tab's session if needed)
 orca-docker --sessions        # list session containers, their branch and state
 orca-docker --rm-session <tab-id|container>   # remove a session (the only way a container is deleted)
 orca-docker --gc              # remove sessions stopped for > 14 days (--gc --all: every stopped one)
@@ -189,6 +214,24 @@ orca-docker --print-config claude --model opus   # show the docker create/exec c
 
 Every launch prints the noVNC URL (`http://127.0.0.1:26xxx/vnc.html?autoconnect=1`) so you
 can watch or take over the desktop from a browser.
+
+### Terminal and desktop of a tab's container
+
+In per-tab mode Orca's own terminal tabs run on the host, so the wrapper gives you both from any
+terminal tab (or Quick Command) of the worktree:
+
+```sh
+orca-docker shell [tab-id|container]      # docker exec into the container, login shell at the clone
+orca-docker desktop [tab-id|container]    # noVNC URL, opened in Orca's browser pane when the orca CLI is around
+```
+
+Without an argument the worktree's containers are looked up by path: one running container is
+used directly; if several exist you are asked which (non-interactively: an error listing them).
+A stopped container is started for the shell and stopped again when you leave (unless
+`ORCA_DOCKER_KEEP_RUNNING=1`); for the desktop it stays running. `shell` works while the agent is
+running in the same container — the one-agent lock only covers agent launches. The desktop URL
+is `http://127.0.0.1:<noVNC port>/vnc.html?autoconnect=1&resize=scale`; `orca-docker desktop`
+tries `orca tab create --url … --worktree active` and falls back to printing the URL.
 
 ## Session model: nothing is mounted
 

@@ -188,6 +188,49 @@ code=$?
 set -e
 case "$out" in *"resuming session"*RESUMED*) pass "resume: same container, repo/deps/home state intact" ;; *) fail "resume (exit $code): $out" ;; esac
 
+echo "== shell / desktop into the worktree's container (from a plain terminal, no ORCA_TAB_ID)"
+set +e
+out="$(cd "$WORKTREE" && HOME="$FAKE_HOME" timeout 120 "$WRAPPER" shell -c 'echo "SHELL_OK $(pwd) ${DISPLAY:-nodisplay} $(git symbolic-ref --short HEAD)"' </dev/null 2>"$TMP/shell.err")"
+code=$?
+set -e
+[ "$code" = 0 ] && [ "$out" = "SHELL_OK $WORKTREE $(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" | sed -n 's/^DISPLAY=//p') orca/$TAB" ] \
+  && pass "shell: found the stopped container by worktree, started it, login shell at the clone with DISPLAY" \
+  || fail "shell (exit $code): '$out' $(cat "$TMP/shell.err")"
+[ "$(docker container inspect -f '{{.State.Status}}' "$CONTAINER")" = exited ] && pass "shell: container stopped again after the shell it woke up" || fail "shell left the container running"
+NOVNC_PORT="$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" | sed -n 's/^ORCA_DOCKER_NOVNC_PORT=//p')"
+URL="http://127.0.0.1:${NOVNC_PORT}/vnc.html?autoconnect=1&resize=scale"
+set +e
+out="$(cd "$WORKTREE" && HOME="$FAKE_HOME" PATH="/usr/bin:/bin" timeout 120 "$WRAPPER" desktop </dev/null 2>"$TMP/desktop.err")"
+code=$?
+set -e
+[ "$code" = 0 ] && [ "$out" = "$URL" ] && grep -q "orca CLI not on PATH" "$TMP/desktop.err" && pass "desktop: prints the noVNC URL, explains the missing orca CLI" \
+  || fail "desktop (exit $code): '$out' $(cat "$TMP/desktop.err")"
+[ "$(docker container inspect -f '{{.State.Status}}' "$CONTAINER")" = running ] && pass "desktop: container left running for the desktop" || fail "desktop: container not running"
+curl -fsS -m 10 "http://127.0.0.1:${NOVNC_PORT}/vnc.html" | grep -qi novnc && pass "desktop: noVNC answers on the printed port" || fail "noVNC not reachable on $NOVNC_PORT"
+mkdir -p "$TMP/fake-orca"
+cat > "$TMP/fake-orca/orca" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_ORCA_LOG"; exit "${FAKE_ORCA_EXIT:-0}"
+EOF
+chmod +x "$TMP/fake-orca/orca"
+rm -f "$TMP/fake-orca.log"
+out="$(cd "$WORKTREE" && HOME="$FAKE_HOME" PATH="$TMP/fake-orca:$PATH" FAKE_ORCA_LOG="$TMP/fake-orca.log" "$WRAPPER" desktop "$TAB" </dev/null 2>"$TMP/desktop.err")"
+[ "$out" = "$URL" ] && [ "$(cat "$TMP/fake-orca.log")" = "tab create --url $URL --worktree active" ] && grep -q "opened in Orca's browser pane" "$TMP/desktop.err" \
+  && pass "desktop <tab>: opens the URL in Orca's worktree browser through the orca CLI" || fail "desktop via orca CLI: '$out' log='$(cat "$TMP/fake-orca.log" 2>/dev/null)' $(cat "$TMP/desktop.err")"
+out="$(cd "$WORKTREE" && HOME="$FAKE_HOME" PATH="$TMP/fake-orca:$PATH" FAKE_ORCA_LOG="$TMP/fake-orca.log" FAKE_ORCA_EXIT=3 "$WRAPPER" desktop "$CONTAINER" </dev/null 2>"$TMP/desktop.err")"
+[ "$out" = "$URL" ] && grep -q "could not open a browser tab" "$TMP/desktop.err" && pass "desktop <container>: falls back to the URL when the orca CLI fails" || fail "desktop fallback: '$out' $(cat "$TMP/desktop.err")"
+out="$(docker exec -u "$(id -un)" -e HOME="$FAKE_HOME" "$CONTAINER" bash -lc 'orca-docker desktop --print' 2>"$TMP/desktop.err")"
+[ "$out" = "$URL" ] && pass "in-container 'orca-docker desktop --print' gives the same URL" || fail "in-container desktop --print: '$out' $(cat "$TMP/desktop.err")"
+out="$(docker exec -i -u "$(id -un)" -e HOME="$FAKE_HOME" "$CONTAINER" bash -lc '
+  d=$(mktemp -d); cat > "$d/orca"; chmod +x "$d/orca"
+  ORCA_REMOTE_CLI_BIN_DIR=$d orca-docker desktop >/dev/null 2>&1; cat "$d/log"' 2>&1 <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" > "$(dirname "$0")/log"
+EOF
+)"
+[ "$out" = "tab create --url $URL --worktree active" ] && pass "in-container desktop uses Orca's remote CLI (ORCA_REMOTE_CLI_BIN_DIR) to open the worktree browser" || fail "in-container desktop via remote CLI: '$out'"
+docker stop -t 5 "$CONTAINER" >/dev/null
+
 echo "== --rm-session"
 "$WRAPPER" --rm-session "$TAB" >/dev/null 2>&1 && ! docker container inspect "$CONTAINER" >/dev/null 2>&1 && pass "removed on request" || fail "--rm-session"
 
@@ -220,8 +263,23 @@ wait $TAB_PIDS
 set -e
 for t in a b; do
   [ "$(cat "$TMP/tab-$t.code")" = 0 ] && pass "concurrent tab $t has a desktop" || fail "concurrent tab $t: no window manager ($(tail -3 "$TMP/tab-$t.log" | tr '\n' ' '))"
-  "$WRAPPER" --rm-session "${TAB}-$t" >/dev/null 2>&1 || true
 done
+set +e
+out="$(cd "$WORKTREE" && HOME="$FAKE_HOME" "$WRAPPER" shell -c 'echo picked' </dev/null 2>&1)"
+code=$?
+set -e
+[ "$code" != 0 ] && case "$out" in *"several session containers"*"${TAB}-a"*"${TAB}-b"*) pass "shell: two stopped containers for the worktree -> refuses to guess, lists both" ;; *) false ;; esac \
+  || fail "shell ambiguity (exit $code): $out"
+out="$(cd "$WORKTREE" && HOME="$FAKE_HOME" timeout 120 "$WRAPPER" shell "${TAB}-b" -c 'hostname' </dev/null 2>/dev/null)"
+[ -n "$out" ] && [ "$out" = "$(docker container inspect -f '{{.Config.Hostname}}' "orca-docker-${TAB}-b")" ] \
+  && pass "shell <tab>: explicit tab id enters that container" || fail "shell <tab>: got '$out'"
+for t in a b; do "$WRAPPER" --rm-session "${TAB}-$t" >/dev/null 2>&1 || true; done
+set +e
+out="$(cd "$WORKTREE" && HOME="$FAKE_HOME" "$WRAPPER" shell </dev/null 2>&1)"
+code=$?
+set -e
+[ "$code" != 0 ] && case "$out" in *"no session container for this worktree"*) pass "shell: clear error when the worktree has no container" ;; *) false ;; esac \
+  || fail "shell without container (exit $code): $out"
 
 echo "== exit status + args pass-through"
 set +e

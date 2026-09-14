@@ -26,7 +26,9 @@ start_desktop() {
   local display="${DISPLAY:-:99}"
   local dnum="${display#:}"
 
-  rm -f "/tmp/.X11-unix/X${dnum}" 2>/dev/null
+  # A retained container restarts with /tmp intact: a lock left by an Xvfb that was SIGKILLed
+  # (docker stop timeout) would make the new one refuse the display.
+  rm -f "/tmp/.X11-unix/X${dnum}" "/tmp/.X${dnum}-lock" 2>/dev/null
   Xvfb "$display" -screen 0 "$size" -nolisten tcp -ac +extension RANDR \
     >"$run_dir/xvfb.log" 2>&1 &
   for _ in $(seq 1 50); do
@@ -58,9 +60,10 @@ start_desktop() {
   websockify --web /usr/share/novnc "${bind}:${novnc_port}" "127.0.0.1:${vnc_port}" \
     >"$run_dir/novnc.log" 2>&1 &
 
-  # Wait for the window manager so the first screenshot/click lands on a real desktop.
+  # Wait for the window manager so the first screenshot/click lands on a real desktop, and for
+  # websockify to listen so the noVNC URL printed at "ready" already works.
   for _ in $(seq 1 100); do
-    wmctrl -m >/dev/null 2>&1 && break
+    wmctrl -m >/dev/null 2>&1 && (exec 3<>"/dev/tcp/127.0.0.1/$novnc_port") 2>/dev/null && break
     sleep 0.1
   done
 
