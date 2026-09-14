@@ -50,6 +50,11 @@ chmod 755 "$FAKE_HOME/.orca/agent-hooks/orca-claude-hook.sh"
 echo '{"smoke":true}' > "$FAKE_HOME/.claude.json"
 echo '{"claudeAiOauth":{"accessToken":"smoke-not-a-real-token"}}' > "$FAKE_HOME/.claude/.credentials.json"
 chmod 600 "$FAKE_HOME/.claude/.credentials.json"
+# skills dir with a symlink escaping the tree (docker cp rejects these) + a dangling one
+mkdir -p "$FAKE_HOME/.agents/skills/ext" "$FAKE_HOME/.claude/skills"
+echo 'ext skill' > "$FAKE_HOME/.agents/skills/ext/SKILL.md"
+ln -s ../../.agents/skills/ext "$FAKE_HOME/.claude/skills/ext"
+ln -s ../../nowhere "$FAKE_HOME/.claude/skills/dangling"
 printf '[user]\n\tname = smoke\n\temail = smoke@localhost\n' > "$FAKE_HOME/.gitconfig"
 
 HOOK_PORT="$(node -e 'const s=require("net").createServer().listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
@@ -105,6 +110,8 @@ check test -f notes.txt
 check test -f node_modules/.orca-docker-lockhash
 check test -f "\$HOME/.claude.json"
 check test -f "\$HOME/.claude/.credentials.json"
+check test "\$(cat \$HOME/.claude/skills/ext/SKILL.md)" = 'ext skill'
+check test ! -L "\$HOME/.claude/skills/ext"
 check test "\$(git config user.email)" = smoke@localhost
 check claude --version
 check xdpyinfo

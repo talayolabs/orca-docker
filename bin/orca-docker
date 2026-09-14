@@ -322,15 +322,23 @@ build_exec_cmd() {
 cexec() { docker exec -u "$HOST_USER" "$CONTAINER" "$@"; }
 dcp() { docker cp -aq "$@" 2>/dev/null || docker cp -a "$@"; }  # -a keeps uid/gid (host uid == container uid)
 
+# Directories are streamed through tar with symlinks dereferenced: `docker cp` rejects links
+# that point outside the copied tree (e.g. ~/.claude/skills/x -> ../../.agents/skills/x),
+# and the link target would not exist in the container anyway. Dangling links are skipped.
 copy_in() {  # copy_in <host path> [container path]  — file overwrite / directory contents merge
   local src="$1" dst="${2:-$1}"
   [ -e "$src" ] || return 0
   if [ -d "$src" ]; then
     cexec mkdir -p "$dst" 2>/dev/null || docker exec -u 0 "$CONTAINER" mkdir -p "$dst"
-    dcp "$src/." "$CONTAINER:$dst"
+    local rc=0
+    set +o pipefail  # tar exits 1 for skipped dangling links; only the extraction result matters
+    tar -C "$src" -ch --warning=no-file-removed -f - . 2>/dev/null |
+      docker exec -i -u "$HOST_USER" "$CONTAINER" tar -xf - -C "$dst" 2>/dev/null || rc=$?
+    set -o pipefail
+    [ "$rc" -eq 0 ] || log "warning: could not copy $src into the session (tar exit $rc)"
   else
     cexec mkdir -p "$(dirname "$dst")" 2>/dev/null || docker exec -u 0 "$CONTAINER" mkdir -p "$(dirname "$dst")"
-    dcp "$src" "$CONTAINER:$dst"
+    dcp -L "$src" "$CONTAINER:$dst"
   fi
 }
 
